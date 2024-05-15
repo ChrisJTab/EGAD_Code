@@ -1,0 +1,15 @@
+[submodule "epic/third_party/spdlog"]
+        path = epic/third_party/spdlog
+        url = https://github.com/gabime/spdlog.git
+[submodule "epic/third_party/slabhash"]
+        path = epic/third_party/slabhash
+        url = https://github.com/owensgroup/SlabHash.git
+[submodule "epic/third_party/cuco"]
+        path = epic/third_party/cuco
+        url = https://github.com/NVIDIA/cuCollections.git
+[submodule "epic/third_party/masstree"]
+        path = epic/third_party/masstree
+        url = https://github.com/uoft-felis/masstree.git
+[submodule "epic/third_party/gpubtree"]
+        path = epic/third_party/gpubtree
+        url = https://github.com/ShujianQian/MVGpuBTree.git
