@@ -1,0 +1,9 @@
+mode,cache_pct,median_mtxn_s,n_reps
+hybrid_staging,5,5.439460960769813,3
+hybrid_staging,10,6.762775341186429,3
+hybrid_staging,25,7.012933932966382,3
+hybrid_staging,50,11.970827781666392,3
+hybrid_staging,75,15.34017959456224,3
+hybrid_staging,100,14.039261292433327,3
+gpu_only,,34.61225727204033,3
+cpu_only,,8.586366917160293,3

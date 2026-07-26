@@ -1,0 +1,7 @@
+EGAD/build*/
+EGAD/epic_output/
+epic_stock*/
+EGAD_plotting/logs/
+__pycache__/
+*.pyc
+.idea/

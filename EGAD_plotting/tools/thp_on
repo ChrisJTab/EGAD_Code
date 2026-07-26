@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Exec a command with PR_SET_THP_DISABLE cleared.
+
+Some launch environments (containers, sandboxes, tuned latency profiles) set
+prctl(PR_SET_THP_DISABLE) on their process tree; every child inherits it and
+/proc/self/status shows "THP_enabled: 0". Under that flag madvise(MADV_HUGEPAGE)
+is a silent no-op, so the TPC-C growing-store huge pages never materialize and
+hybrid throughput drops 6-12% at W=128 versus a normal shell. This wrapper
+clears the flag for itself and execs the given command, which inherits the
+cleared state.
+
+Usage: tools/thp_on <command> [args...]
+"""
+import ctypes
+import os
+import sys
+
+PR_SET_THP_DISABLE = 41
+
+if len(sys.argv) < 2:
+    sys.stderr.write(__doc__)
+    sys.exit(2)
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0) != 0:
+    err = ctypes.get_errno()
+    sys.stderr.write(f"thp_on: prctl(PR_SET_THP_DISABLE, 0) failed: {os.strerror(err)}\n")
+    sys.exit(1)
+
+os.execvp(sys.argv[1], sys.argv[1:])

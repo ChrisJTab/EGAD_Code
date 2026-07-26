@@ -1,0 +1,3 @@
+mode,index_transfer,indexing,submission,prepareEpoch,initialization,execution,writeback,total_ms
+async,1064,779,774,3258,728,2865,1789,11.26
+sync,505,774,754,3116,735,2869,16810,25.56

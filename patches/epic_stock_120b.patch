@@ -1,0 +1,19 @@
+diff --git a/benchmarks/ycsb_table.h b/benchmarks/ycsb_table.h
+index 9b9beb7..a30c595 100644
+--- a/benchmarks/ycsb_table.h
++++ b/benchmarks/ycsb_table.h
+@@ -13,12 +13,12 @@ using YcsbKey = uint32_t;
+ 
+ struct YcsbValue
+ {
+-    uint8_t data[10][100];
++    uint8_t data[10][12];
+ };
+ 
+ struct YcsbFieldValue
+ {
+-    uint8_t data[100];
++    uint8_t data[12];
+ };
+ 
+ }

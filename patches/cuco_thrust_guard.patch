@@ -1,0 +1,16 @@
+diff --git a/include/cuco/detail/pair/pair.inl b/include/cuco/detail/pair/pair.inl
+index 3279a91..9bd1fc5 100644
+--- a/include/cuco/detail/pair/pair.inl
++++ b/include/cuco/detail/pair/pair.inl
+@@ -50,9 +50,11 @@ __host__ __device__ constexpr bool operator==(cuco::pair<T1, T2> const& lhs,
+ 
+ }  // namespace cuco
+ 
++#if THRUST_VERSION < 101400 
+ namespace thrust {
+ #include <cuco/detail/pair/tuple_helpers.inl>
+ }  // namespace thrust
++#endif
+ 
+ namespace cuda::std {
+ #include <cuco/detail/pair/tuple_helpers.inl>

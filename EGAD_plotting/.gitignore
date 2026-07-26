@@ -1,0 +1,8 @@
+# Raw per-cell benchmark logs (regenerable from tests/*.sh)
+logs/
+
+# Driver wrapper logs at the run_all.sh layer (also regenerable)
+*_driver.log
+
+# Python bytecode
+__pycache__/

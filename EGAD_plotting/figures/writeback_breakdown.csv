@@ -1,0 +1,9 @@
+bench,mode,index_transfer,indexing,submission,transfer_compute,transfer_data,initialization,execution,writeback,total_ms
+ycsba,async,900,384,188,5635,0,618,1656,803,10.184
+ycsba,sync,266,320,186,5177,0,601,1638,4276,12.464
+ycsbb,async,679,335,127,4871,0,577,1563,305,8.457
+ycsbb,sync,265,330,120,4869,0,547,1562,641,8.334
+ycsbc,async,265,338,95,4704,0,539,1554,82,7.577
+ycsbc,sync,265,335,94,4725,0,542,1558,81,7.6
+ycsbf,async,920,383,191,5664,0,617,1653,806,10.234
+ycsbf,sync,266,320,186,5193,0,602,1635,4283,12.485
