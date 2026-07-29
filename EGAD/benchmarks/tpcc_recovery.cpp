@@ -124,18 +124,25 @@ TpccDb::TpccGrowingCounts TpccDb::growingInsertCounts() const
 // end-of-(E-2) slot has been overwritten, so both the old marker (E) and the
 // new one (E+1) describe a recoverable store. Phases 0-2 of epoch E see the
 // value set by runEpoch(E-1) (= E); phases 3 and 5 see E+1. The shift leaves
-// prev2 == f_{crash_epoch-2} (the rollback target); the index cursors it
+// p2 == f_{crash_epoch-2} (the rollback target); the index cursors it
 // reads advance only during indexTxns, long before any bump position in the
-// epoch. No-op on non-durable runs.
+// epoch. No-op on non-durable runs. The banked prepare/publish split keeps
+// the marker coherent if the process dies mid-update (recovery_meta.h) and
+// gives the torn-marker probe its injection point.
 void TpccDb::bumpRecoveryMarker(uint32_t crash_epoch)
 {
     if (!recovery_meta_) return;
     const TpccGrowingCounts gc = growingInsertCounts();
-    recovery_meta_->magic = kRecoveryMetaMagic;
-    recovery_meta_->crash_epoch = crash_epoch;
-    recovery_meta_->no_p2 = recovery_meta_->no_p1; recovery_meta_->no_p1 = static_cast<uint32_t>(gc.new_order);
-    recovery_meta_->o_p2  = recovery_meta_->o_p1;  recovery_meta_->o_p1  = static_cast<uint32_t>(gc.order);
-    recovery_meta_->ol_p2 = recovery_meta_->ol_p1; recovery_meta_->ol_p1 = static_cast<uint32_t>(gc.order_line);
+    const uint64_t word = recovery_meta_->prepare(crash_epoch,
+        [&](TpccRecoveryCursors& nb, const TpccRecoveryCursors* ob) {
+            nb.no_p2 = ob ? ob->no_p1 : 0u; nb.no_p1 = static_cast<uint32_t>(gc.new_order);
+            nb.o_p2  = ob ? ob->o_p1  : 0u; nb.o_p1  = static_cast<uint32_t>(gc.order);
+            nb.ol_p2 = ob ? ob->ol_p1 : 0u; nb.ol_p1 = static_cast<uint32_t>(gc.order_line);
+        });
+#ifdef EGAD_VALIDATION
+    maybeTearMarkerAt(crash_epoch);
+#endif
+    recovery_meta_->publishPrepared(word);
 }
 
 #ifdef EGAD_VALIDATION  // recovery state-hash + negative-control hooks (validation only)

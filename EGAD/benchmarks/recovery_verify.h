@@ -32,8 +32,11 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>    // std::fflush (torn-marker probe)
 #include <cstdlib>   // std::getenv
 #include <cstring>   // std::memcmp / std::memcpy
+
+#include <unistd.h>  // _exit (torn-marker probe)
 
 #include <storage.h> // epic::Record<T>
 #include "util_log.h"
@@ -126,6 +129,32 @@ inline void negControlPerturb(Record<ValueType> *recs, size_t count, const char 
         std::memcpy(&recs[0].value2, &recs[1].value2, vsz);
         std::memcpy(&recs[1].value2, &tmp,            vsz);
         logger.Info("[NEG-CONTROL] swapped full values of {} CRID {} and {}", tag, 0, 1);
+    }
+}
+
+// Torn-marker probe. Dies between the recovery marker's bank
+// write and its publish when EPIC_TEAR_MARKER_AT_EPOCH names the epoch
+// being run (the bump for epoch E carries crash_epoch E+1), modeling a
+// real fault that terminates the process from another thread mid-update.
+// Recovery from the torn state must come up on the previous complete
+// marker, which makes the cell equivalent to a phase-4 crash of the same
+// epoch. Never fires in recover mode.
+inline void maybeTearMarkerAt(uint32_t crash_epoch)
+{
+    static const int kTearEpoch = []{
+        const char* s = std::getenv("EPIC_TEAR_MARKER_AT_EPOCH");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const bool kRecover = std::getenv("EPIC_RECOVER_FROM") != nullptr;
+    if (kRecover || kTearEpoch < 0) return;
+    if (static_cast<uint32_t>(kTearEpoch) + 1u == crash_epoch) {
+        // stderr, not the async logger: _exit skips the logger's flush, and
+        // the probe's announcement must survive the death it announces.
+        std::fprintf(stderr,
+            "[CRASH] torn-marker probe at epoch %d -- bank written, publish withheld, process will die\n",
+            kTearEpoch);
+        std::fflush(nullptr);
+        _exit(84);
     }
 }
 

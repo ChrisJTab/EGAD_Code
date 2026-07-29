@@ -583,13 +583,14 @@ void YcsbBenchmark::runBenchmark()
 
     uint32_t start_epoch = 1;
     if (kRecover) {
-        const uint32_t E = (recovery_meta_ && recovery_meta_->magic == kMetaMagic)
-                               ? recovery_meta_->crash_epoch : 0u;
+        uint32_t E = 0;
+        const YcsbRecoveryCursors* cursors = nullptr;
+        if (recovery_meta_) recovery_meta_->read(E, cursors);
         if (E < 2) {
             logger.Warn("[RECOVER] crash marker E={} < 2 (no end-of-(E-2) to roll back to); "
                         "falling back to full replay from epoch 1", E);
         } else {
-            const uint32_t f_e2 = recovery_meta_->free_start_prev2;  // insert cursor at end-of-(E-2)
+            const uint32_t f_e2 = cursors->free_start_p2;  // insert cursor at end-of-(E-2)
             logger.Info("[RECOVER] crash marker E={}; roll back to end-of-({}) (f_(E-2)={}), resume at epoch {}",
                         E, static_cast<int>(E) - 2, f_e2, E - 1);
             // 1) Demote the Primary Store's dual-version tags to end-of-(E-2).

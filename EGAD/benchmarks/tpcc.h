@@ -26,6 +26,7 @@
 #include <benchmarks/tpcc_cpu_shadow_index.h>
 #include <benchmarks/tpcc_gpu_aux_index.h>
 #include <gpu_allocator.h>
+#include <benchmarks/recovery_meta.h>
 #include <benchmarks/tpcc_hybrid_stager.h>
 
 namespace epic::tpcc {
@@ -138,12 +139,15 @@ private:
     // writeback is queued (bumpRecoveryMarker), so on a crash it names the epoch E
     // whose predecessor's writeback is in-flight; recovery rolls the Primary Store
     // back to end-of-(E-2) and replays E-1 and E. The 3 cursor pairs carry
-    // f_{E-1}/f_{E-2} for the growing tables (prev2 == f_{E-2} = the rollback target).
-    struct RecoveryMeta {
-        uint32_t magic; uint32_t crash_epoch;
+    // f_{E-1}/f_{E-2} for the growing tables (p2 == f_{E-2} = the rollback target).
+    // The banked publish (recovery_meta.h) keeps the epoch and the
+    // cursors coherent when a fault kills the process mid-update.
+    struct TpccRecoveryCursors {
         uint32_t no_p1, no_p2, o_p1, o_p2, ol_p1, ol_p2;
     };
-    static constexpr uint32_t kRecoveryMetaMagic = 0xE6AD0002u;
+    using RecoveryMeta = BankedRecoveryMeta<TpccRecoveryCursors>;
+    static_assert(offsetof(RecoveryMeta, publish) % 8 == 0,
+        "publish word must be 8-byte aligned for the single-store publish");
     RecoveryMeta* recovery_meta_ = nullptr;
 
 public:

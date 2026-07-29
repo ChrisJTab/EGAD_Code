@@ -931,13 +931,14 @@ void TpccDb::runBenchmark()
     const bool kRecover = std::getenv("EPIC_RECOVER_FROM") != nullptr;
     uint32_t start_epoch = 1;
     if (kRecover) {
-        const uint32_t E = (recovery_meta_ && recovery_meta_->magic == kRecoveryMetaMagic)
-                               ? recovery_meta_->crash_epoch : 0u;
+        uint32_t E = 0;
+        const TpccRecoveryCursors* cursors = nullptr;
+        if (recovery_meta_) recovery_meta_->read(E, cursors);
         if (E < 2) {
             logger.Warn("[RECOVER] crash marker E={} < 2 (no end-of-(E-2) to roll back to); "
                         "falling back to full replay from epoch 1", E);
         } else {
-            const TpccFreeStarts f_e2{ recovery_meta_->no_p2, recovery_meta_->o_p2, recovery_meta_->ol_p2 };  // f_{E-2}
+            const TpccFreeStarts f_e2{ cursors->no_p2, cursors->o_p2, cursors->ol_p2 };  // f_{E-2}
             logger.Info("[RECOVER] crash marker E={}; roll back to end-of-({}) "
                         "(f_(E-2): NO={} O={} OL={}), resume at epoch {}",
                         E, static_cast<int>(E) - 2,

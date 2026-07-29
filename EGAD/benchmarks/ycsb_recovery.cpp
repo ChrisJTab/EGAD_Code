@@ -155,17 +155,25 @@ uint32_t YcsbBenchmark::currentInsertCount() const
 // end-of-(E-1) is fully durable and no end-of-(E-2) slot has been
 // overwritten, so both the old marker (E) and the new one (E+1) describe a
 // recoverable store. Phases 0-2 of epoch E see the value set by
-// runEpoch(E-1) (= E); phases 3 and 5 see E+1. The shift leaves prev2 ==
+// runEpoch(E-1) (= E); phases 3 and 5 see E+1. The shift leaves p2 ==
 // f_{crash_epoch-2} (the rollback target); the insert cursor it reads
 // advances only during indexTxns, long before any bump position in the
-// epoch. No-op on non-durable runs.
+// epoch. No-op on non-durable runs. The banked prepare/publish split keeps
+// the marker coherent if the process dies mid-update (recovery_meta.h) and
+// gives the torn-marker probe its injection point.
 void YcsbBenchmark::bumpRecoveryMarker(uint32_t crash_epoch)
 {
     if (!recovery_meta_) return;
-    recovery_meta_->magic = kMetaMagic;
-    recovery_meta_->crash_epoch = crash_epoch;
-    recovery_meta_->free_start_prev2 = recovery_meta_->free_start_prev1;
-    recovery_meta_->free_start_prev1 = currentInsertCount();
+    const uint32_t insert_count = currentInsertCount();
+    const uint64_t word = recovery_meta_->prepare(crash_epoch,
+        [&](YcsbRecoveryCursors& nb, const YcsbRecoveryCursors* ob) {
+            nb.free_start_p2 = ob ? ob->free_start_p1 : 0u;
+            nb.free_start_p1 = insert_count;
+        });
+#ifdef EGAD_VALIDATION
+    maybeTearMarkerAt(crash_epoch);
+#endif
+    recovery_meta_->publishPrepared(word);
 }
 
 void YcsbBenchmark::verifyInsertedRecords()

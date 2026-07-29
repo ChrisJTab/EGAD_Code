@@ -17,6 +17,7 @@
 #include <benchmarks/ycsb_config.h>
 #include <benchmarks/ycsb_txn.h>
 #include <benchmarks/ycsb_storage.h>
+#include <benchmarks/recovery_meta.h>
 #include <benchmarks/ycsb_cpu_shadow_index.h>
 #include <benchmarks/ycsb_index.h>
 #include <benchmarks/ycsb_submitter.h>
@@ -140,13 +141,16 @@ private:
     // writeback is queued (bumpRecoveryMarker), so on a crash it names the epoch E
     // whose predecessor's writeback is in-flight; recovery rolls the Primary Store
     // back to end-of-(E-2) and replays E-1 and E. The single cursor pair carries
-    // f_{E-1}/f_{E-2} for the insert table (prev2 == f_{E-2} = the rollback target;
+    // f_{E-1}/f_{E-2} for the insert table (p2 == f_{E-2} = the rollback target;
     // YCSB-F has no inserts so both stay 0).
-    struct RecoveryMeta {
-        uint32_t magic; uint32_t crash_epoch;
-        uint32_t free_start_prev1; uint32_t free_start_prev2;
+    // The banked publish (recovery_meta.h) keeps the epoch and the
+    // cursors coherent when a fault kills the process mid-update.
+    struct YcsbRecoveryCursors {
+        uint32_t free_start_p1; uint32_t free_start_p2;
     };
-    static constexpr uint32_t kMetaMagic = 0xE6AD0001u;
+    using RecoveryMeta = BankedRecoveryMeta<YcsbRecoveryCursors>;
+    static_assert(offsetof(RecoveryMeta, publish) % 8 == 0,
+        "publish word must be 8-byte aligned for the single-store publish");
     RecoveryMeta* recovery_meta_ = nullptr;
 
     // Walk every insert-allocated CRID's slot in the CPU primary store and
