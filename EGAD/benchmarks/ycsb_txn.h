@@ -14,7 +14,8 @@ enum class YcsbOpType : uint8_t
     UPDATE,                 /* write one field */
     READ_MODIFY_WRITE,      /* read one field, modify that field, write that field */
     FULL_READ_MODIFY_WRITE, /* read all fields, modify one field, write that fields */
-    INSERT                  /* insert a new record */
+    INSERT,                 /* insert a new record */
+    DELETE                  /* delete a record: index-phase only, no record op */
 };
 
 struct YcsbTxn

@@ -55,9 +55,15 @@ struct Timeline {
 class HybridStager
 {
 public:
+    // enable_reclaim_eviction activates the reclaim-first eviction pass
+    // for delete-bearing mixes (reclaim_flags.cuh): deleted records'
+    // slots are flagged via mark_reclaimable and drained before live
+    // residents. Off for mixes without deletes (no flag storage, no
+    // extra eviction pass).
     HybridStager(Allocator& alloc, YcsbRecordArrType GPU_records, YcsbVersionArrType GPU_versions,
         YcsbRecordArrType CPU_records,
-        uint32_t gpu_capacity, uint32_t num_units, bool split_field);
+        uint32_t gpu_capacity, uint32_t num_units, bool split_field,
+        bool enable_reclaim_eviction = false);
 
     ~HybridStager();
 
@@ -91,6 +97,13 @@ public:
     const uint32_t* d_insert_keys, uint32_t n_insert,
     FlushHandle* flush_handle = nullptr);
     void periodicFlush(uint32_t epoch);
+
+    // Flag the cache slots of this epoch's deleted CRIDs reclaim-first.
+    // Called before prepareEpoch each epoch on delete-bearing mixes; the
+    // eviction pass then drains flagged slots ahead of live residents
+    // once their needed-set protection and writeback pins lapse. No-op
+    // when reclaim eviction is disabled or n is 0.
+    void mark_reclaimable(const uint32_t* d_crids, uint32_t n);
 
     // ----------------------------
     // Flush pipeline (overlap flush(E) with epoch E+1 work)
@@ -258,6 +271,12 @@ private:
     // ----------------------------
     // Device flag: d_flush_pinned_flag_[grid] == 1 => grid is pinned (cannot be evicted)
     uint8_t*  d_flush_pinned_flag_ = nullptr;
+
+    // Reclaim-first eviction (delete-bearing mixes): per-slot flag set by
+    // mark_reclaimable, preferred by the eviction pre-pass, cleared on
+    // rename. nullptr when disabled.
+    bool      reclaim_eviction_active_ = false;
+    uint8_t*  d_reclaim_flag_ = nullptr;
 
     // --- reusable host vectors for pre-SG D2H (avoid per-epoch heap alloc) ---
     // Pinned host buffers for pre-SG D2H (avoids copy engine serialization with worker D2H)

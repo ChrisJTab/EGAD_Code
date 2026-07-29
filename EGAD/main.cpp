@@ -105,6 +105,19 @@ int main(int argc, char **argv)
                 ycsb_config.recent_read_bias = 0.3;
                 ycsb_config.recent_window_size = 100'000;
             }
+            else if (bench == "ycsbw")
+            {
+                // Sliding-window churn mix for the delete path: 60% reads,
+                // 20% updates, 10% inserts, 10% deletes. Each epoch inserts
+                // at the head of the key space and deletes the same number of
+                // keys from the tail, so the live set stays at its starting
+                // size while the key space slides. Reads and updates draw
+                // from the live window only, which keeps every delete
+                // terminal (no operation ever touches a key after its
+                // delete). Requires hybrid_staging with split_field=false.
+                bench = "ycsb";
+                ycsb_config.txn_mix = {60, 20, 0, 10, 10};
+            }
             else if (bench == "tpccn")
             {
                 bench = "tpcc";

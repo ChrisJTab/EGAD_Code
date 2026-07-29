@@ -105,6 +105,10 @@ public:
     // hook tracks f_{E-2} across epochs from this.
     uint32_t currentInsertCount() const;
 
+    // Current delete-log cursor (0 if not the GPU index or the mix has
+    // no deletes). Tracked in the marker exactly like the insert cursor.
+    uint32_t currentDeleteCount() const;
+
     // Advance the durable crash marker to `crash_epoch` and shift
     // the insert-cursor history (prev1<-current, prev2<-prev1). Called once per
     // epoch right after that epoch's writeback is queued/flushed, so the marker
@@ -144,9 +148,12 @@ private:
     // f_{E-1}/f_{E-2} for the insert table (p2 == f_{E-2} = the rollback target;
     // YCSB-F has no inserts so both stay 0).
     // The banked publish (recovery_meta.h) keeps the epoch and the
-    // cursors coherent when a fault kills the process mid-update.
+    // cursors coherent when a fault kills the process mid-update. The
+    // delete-log cursor pair is the insert pair's dual (d_p2 = deletes
+    // durable at end-of-(E-2), the delete-side rollback target).
     struct YcsbRecoveryCursors {
         uint32_t free_start_p1; uint32_t free_start_p2;
+        uint32_t del_p1; uint32_t del_p2;
     };
     using RecoveryMeta = BankedRecoveryMeta<YcsbRecoveryCursors>;
     static_assert(offsetof(RecoveryMeta, publish) % 8 == 0,

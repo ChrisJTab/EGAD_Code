@@ -61,6 +61,34 @@ void __global__ prepareYcsbIndexKernel(GpuTxnArray txns, uint32_t *insert, uint3
     }
 }
 
+// Emit the epoch's delete set. For each DELETE op, writes the key and its
+// resolved CRID (from the params the lookup kernel just filled) into
+// per-op-slot arrays and raises the slot's flag; DeviceSelect::Flagged
+// compacts both arrays with the same flags, preserving op order, so the
+// durable delete log's append order is deterministic.
+void __global__ prepareYcsbDeleteKernel(GpuTxnArray txns, GpuTxnArray params,
+    uint32_t *keys, uint32_t *crids, uint8_t *flags, uint32_t num_txns)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_txns)
+    {
+        return;
+    }
+    YcsbTxn *txn = reinterpret_cast<YcsbTxn *>(txns.getTxn(tid)->data);
+    YcsbTxnParam *param = reinterpret_cast<YcsbTxnParam *>(params.getTxn(tid)->data);
+    int base = tid * 10;
+    for (int i = 0; i < 10; ++i)
+    {
+        const bool is_delete = txn->ops[i] == YcsbOpType::DELETE;
+        flags[base + i] = is_delete ? 1 : 0;
+        if (is_delete)
+        {
+            keys[base + i] = txn->keys[i];
+            crids[base + i] = param->record_ids[i];
+        }
+    }
+}
+
 // Translate each op's key to its record id via the index, copying ops and
 // field ids through to the executor-facing params.
 void __global__ indexYcsbKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDeviceView index_view, uint32_t num_txns)
@@ -101,6 +129,11 @@ public:
 //    static constexpr cuco::empty_value<uint32_t> empty_value_sentinel{static_cast<uint32_t>(-1)};
         static constexpr cuco::empty_key<uint32_t> empty_key_sentinel{0xffffffff};
         static constexpr cuco::empty_value<uint32_t> empty_value_sentinel{0xffffffff};
+        // Erased-slot sentinel for the delete path. Passed at BOTH map
+        // construction sites (ctor and the recovery rebuild); cuco's erase
+        // throws at runtime on a map built without it. Distinct from the
+        // empty sentinel and outside the key universe (keys < num_records).
+        static constexpr cuco::erased_key<uint32_t> erased_key_sentinel{0xfffffffe};
 
     YcsbConfig ycsb_config;
 
@@ -130,11 +163,26 @@ public:
     void *d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
 
+    // Delete-set scratch, allocated only for delete-bearing mixes
+    // (nullptr otherwise; mixes without deletes never run the delete
+    // block). Per-op-slot key/CRID arrays + flags, their Flagged-compacted
+    // outputs, a mapped count, and the cumulative delete-log cursor.
+    uint32_t *d_deletes = nullptr, *d_valid_deletes = nullptr;
+    uint32_t *d_delete_crids = nullptr, *d_valid_delete_crids = nullptr;
+    uint8_t *d_delete_flags = nullptr;
+    thrust::device_ptr<uint32_t> dp_valid_deletes;
+    uint32_t *d_num_delete = nullptr;   // mapped device pointer
+    uint32_t *h_num_delete = nullptr;   // mapped host pointer (same memory)
+    uint32_t delete_count = 0;          // cumulative; the durable delete-log cursor
+    uint32_t num_deletes_this_epoch = 0;
+    void *d_flagged_temp = nullptr;
+    size_t flagged_temp_bytes = 0;
+
     explicit YcsbGpuIndexImpl(YcsbConfig ycsb_config, YcsbCpuShadowIndex& shadow)
         : ycsb_config(ycsb_config)
         , shadow_(shadow)
         , index(std::make_shared<YcsbIndexType>(static_cast<size_t>(std::ceil(ycsb_config.num_records / load_factor)),
-              empty_key_sentinel, empty_value_sentinel))
+              empty_key_sentinel, empty_value_sentinel, erased_key_sentinel))
         , index_view(index->get_device_view())
     {
         auto &logger = Logger::GetInstance();
@@ -159,6 +207,24 @@ public:
 
         logger.Trace("Allocating {} bytes for temp storage", formatSizeBytes(temp_storage_bytes));
         gpu_err_check(cudaMalloc(&d_temp_storage, temp_storage_bytes));
+
+        // Delete-set scratch, delete-bearing mixes only.
+        if (ycsb_config.txn_mix.num_deletes > 0) {
+            const size_t n_slots =
+                static_cast<size_t>(ycsb_config.num_txns) * ycsb_config.num_ops_per_txn;
+            gpu_err_check(cudaMalloc(&d_deletes, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_valid_deletes, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_delete_crids, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_valid_delete_crids, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_delete_flags, sizeof(uint8_t) * n_slots));
+            dp_valid_deletes = thrust::device_pointer_cast(d_valid_deletes);
+            gpu_err_check(cudaHostAlloc(&h_num_delete, sizeof(uint32_t), cudaHostAllocMapped));
+            *h_num_delete = 0;
+            gpu_err_check(cudaHostGetDevicePointer(&d_num_delete, h_num_delete, 0));
+            cub::DeviceSelect::Flagged(d_flagged_temp, flagged_temp_bytes,
+                d_deletes, d_delete_flags, d_valid_deletes, d_num_delete, n_slots);
+            gpu_err_check(cudaMalloc(&d_flagged_temp, flagged_temp_bytes));
+        }
 
         // CPU shadow allocation now lives in YcsbCpuShadowIndex's ctor
         // (host-side, owned by YcsbBenchmark). This class just holds a
@@ -284,9 +350,41 @@ public:
                 take * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             shadow_.mirrorEpoch(take, old_free_start);
         }
+
+        // Delete application, after this epoch's lookups so every
+        // transaction of the epoch still resolves the key (epoch-boundary
+        // visibility); no transaction of the next epoch can. Emits the
+        // op-ordered delete set, erases the keys from the cuco map, and
+        // appends the keys to the durable delete log. The compacted CRID
+        // list stays on device for the stager's reclaim-first marking.
+        if (ycsb_config.txn_mix.num_deletes > 0) {
+            const size_t n_slots =
+                static_cast<size_t>(ycsb_config.num_txns) * ycsb_config.num_ops_per_txn;
+            prepareYcsbDeleteKernel<<<(ycsb_config.num_txns + block_size - 1) / block_size, block_size>>>(
+                GpuTxnArray(txn_array), GpuTxnArray(index_array),
+                d_deletes, d_delete_crids, d_delete_flags, ycsb_config.num_txns);
+            gpu_err_check(cudaPeekAtLastError());
+            cub::DeviceSelect::Flagged(d_flagged_temp, flagged_temp_bytes,
+                d_deletes, d_delete_flags, d_valid_deletes, d_num_delete, n_slots);
+            cub::DeviceSelect::Flagged(d_flagged_temp, flagged_temp_bytes,
+                d_delete_crids, d_delete_flags, d_valid_delete_crids, d_num_delete, n_slots);
+            gpu_err_check(cudaStreamSynchronize(0));
+            const uint32_t num_deletes = *h_num_delete;
+            num_deletes_this_epoch = num_deletes;
+            logger.Info("Found {} deletes", num_deletes);
+            if (num_deletes > 0) {
+                index->erase(dp_valid_deletes, dp_valid_deletes + num_deletes);
+                gpu_err_check(cudaStreamSynchronize(0));
+                gpu_err_check(cudaMemcpy(
+                    shadow_.h_delete_keys(), d_valid_deletes,
+                    num_deletes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                shadow_.mirrorEpochDeletes(num_deletes, delete_count);
+                delete_count += num_deletes;
+            }
+        }
     }
 
-    void rebuildCucoFromShadow(uint32_t current_free_start)
+    void rebuildCucoFromShadow(uint32_t current_free_start, uint32_t current_delete_count)
     {
         auto& logger = Logger::GetInstance();
 
@@ -297,13 +395,19 @@ public:
                                   + static_cast<uint64_t>(current_free_start);
         logger.Info("Rebuilding cuco from CPU shadow (max_crid={})", max_crid);
 
-        // Tear down old cuco + create fresh one at the same load_factor.
+        // Tear down old cuco + create fresh one at the same load_factor,
+        // with the same erased-key sentinel as the ctor (cuco erase throws
+        // on a map built without it).
         index.reset();
         index = std::make_shared<YcsbIndexType>(
             static_cast<size_t>(std::ceil(ycsb_config.num_records / load_factor)),
-            empty_key_sentinel, empty_value_sentinel);
+            empty_key_sentinel, empty_value_sentinel, erased_key_sentinel);
         index_view = index->get_device_view();
         free_start = current_free_start;   // resync host scalar
+        // Resync the delete-log cursor to the rollback point so replay's
+        // re-applied deletes overwrite the log tail at the same positions.
+        delete_count = current_delete_count;
+        num_deletes_this_epoch = 0;
 
         // Reseed d_free_rows so d_free_rows[j] == starting_num_records + j,
         // matching loadInitialData()'s invariant. Idempotent overwrite; assumes
@@ -380,15 +484,33 @@ void YcsbGpuIndex::indexTxns(TxnArray<YcsbTxn> &txn_array, TxnArray<YcsbTxnParam
     impl.indexTxns(txn_array, index_array, epoch_id);
 }
 
-void YcsbGpuIndex::rebuildCucoFromShadow(uint32_t current_free_start)
+void YcsbGpuIndex::rebuildCucoFromShadow(uint32_t current_free_start, uint32_t current_delete_count)
 {
     auto &impl = std::any_cast<YcsbGpuIndexImpl &>(gpu_index_impl);
-    impl.rebuildCucoFromShadow(current_free_start);
+    impl.rebuildCucoFromShadow(current_free_start, current_delete_count);
 }
 
 uint32_t YcsbGpuIndex::getInsertCount() const
 {
     auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
     return impl.free_start;
+}
+
+uint32_t YcsbGpuIndex::getDeleteCount() const
+{
+    auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
+    return impl.delete_count;
+}
+
+const uint32_t* YcsbGpuIndex::deleteCridsDevice() const
+{
+    auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
+    return impl.d_valid_delete_crids;
+}
+
+uint32_t YcsbGpuIndex::numDeletesThisEpoch() const
+{
+    auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
+    return impl.num_deletes_this_epoch;
 }
 } // namespace epic::ycsb

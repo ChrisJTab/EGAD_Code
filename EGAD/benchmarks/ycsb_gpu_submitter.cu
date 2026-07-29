@@ -82,6 +82,9 @@ void __global__ prepareSubmitYcsbTxn(YcsbConfig config, GpuTxnArray txns, uint32
         case YcsbOpType::INSERT:
             ops += config.split_field ? 10 : 1;
             break;
+        case YcsbOpType::DELETE:
+            // Index-phase operation; expands into no record ops.
+            break;
         }
     }
     num_ops[tid] = ops;
@@ -254,6 +257,11 @@ void __global__ submitYcsbTxn(YcsbConfig config, GpuTxnArray txns, uint32_t *off
                     offsetof(YcsbExecPlan, plans[i].insert_plan.write_loc) / sizeof(uint32_t),
                     write_op, op_is_insert_kind);
             }
+            break;
+        case YcsbOpType::DELETE:
+            // Index-phase operation; emits no record ops, so the deleted
+            // record enters neither the planner's op stream nor the
+            // stager's needed set.
             break;
         }
     }

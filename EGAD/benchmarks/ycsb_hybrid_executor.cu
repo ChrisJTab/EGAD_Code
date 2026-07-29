@@ -26,7 +26,8 @@ constexpr uint32_t num_warps = block_size / kDeviceWarpSize;
 __device__ uint32_t txn_counter = 0; /* used for scheduling txns among threads */
 const uint32_t zero = 0;
 
-__device__ char *op_str[] = {"READ", "FULL_READ", "UPDATE", "READ_MODIFY_WRITE", "FULL_READ_MODIFY_WRITE", "INSERT"};
+__device__ char *op_str[] = {
+    "READ", "FULL_READ", "UPDATE", "READ_MODIFY_WRITE", "FULL_READ_MODIFY_WRITE", "INSERT", "DELETE"};
 
 __device__ char *YcsbOpTypeToString(YcsbOpType type)
 {
@@ -222,6 +223,9 @@ __global__ void gpuPiecewiseExecKernel(YcsbConfig config, void *records, void *v
         }
         break;
     }
+    case YcsbOpType::DELETE:
+        // Index-phase operation; contributes no record work and no plan entry.
+        break;
     default:
         assert(false);
     }
@@ -314,6 +318,9 @@ __global__ void gpuNoSplitPiecewiseExecKernel(YcsbConfig config, void *records, 
             epoch, data, lane_id, dirty_v1, dirty_v2);
         break;
     }
+    case YcsbOpType::DELETE:
+        // Index-phase operation; contributes no record work and no plan entry.
+        break;
     default:
         printf("Invalid op type: %s\n", YcsbOpTypeToString(txn->ops[warp_piece_id]));
         assert(false);
@@ -403,6 +410,9 @@ __global__ void gpuNoSplitThreadPiecewiseExecKernel(YcsbConfig config, void *rec
             dirty_v1, dirty_v2);
         break;
     }
+    case YcsbOpType::DELETE:
+        // Index-phase operation; contributes no record work and no plan entry.
+        break;
     default:
         printf("Invalid op type: %s\n", YcsbOpTypeToString(txn->ops[thread_piece_id]));
         assert(false);

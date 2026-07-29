@@ -28,6 +28,7 @@ struct YcsbConfig
         size_t num_writes = 0;
         size_t num_rmw = 0;
         size_t num_inserts = 0;
+        size_t num_deletes = 0;
 
         YcsbTxnMix() = default;
         YcsbTxnMix(size_t num_reads, size_t num_writes, size_t num_rmw, size_t num_inserts)
@@ -37,6 +38,15 @@ struct YcsbConfig
             , num_inserts(num_inserts)
         {
             assert(num_reads + num_writes + num_rmw + num_inserts == 100);
+        }
+        YcsbTxnMix(size_t num_reads, size_t num_writes, size_t num_rmw, size_t num_inserts, size_t num_deletes)
+            : num_reads(num_reads)
+            , num_writes(num_writes)
+            , num_rmw(num_rmw)
+            , num_inserts(num_inserts)
+            , num_deletes(num_deletes)
+        {
+            assert(num_reads + num_writes + num_rmw + num_inserts + num_deletes == 100);
         }
     } txn_mix;
     size_t num_records = 2'500'000;

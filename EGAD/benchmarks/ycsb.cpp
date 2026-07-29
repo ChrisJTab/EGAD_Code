@@ -45,6 +45,17 @@ YcsbBenchmark::YcsbBenchmark(YcsbConfig config)
     alloc_ = std::make_shared<GpuAllocator>();
     auto &logger = Logger::GetInstance();
 
+    // Delete-bearing mixes are supported on the hybrid staging path with
+    // whole-record storage only. The other executors' op switches have no
+    // delete arm, and the split-field per-field expansion has no delete
+    // encoding; fail at construction rather than at a kernel assert.
+    if (config.txn_mix.num_deletes > 0
+        && (config.execution_mode != ExecMode::HYBRID_STAGING || config.split_field))
+    {
+        throw std::runtime_error(
+            "delete-bearing YCSB mixes require -y hybrid_staging with -f false (no field split)");
+    }
+
     // Hybrid staging with async flush overlap is sensitive to CUDA host-side
     // sync latency: the default Auto mode parks the thread on a driver IRQ,
     // and wake-up from deep C-states on our CPU adds ~1 ms to every
@@ -257,6 +268,11 @@ void YcsbBenchmark::generateTxns()
         {
             return config.full_record_read ? YcsbOpType::FULL_READ_MODIFY_WRITE : YcsbOpType::READ_MODIFY_WRITE;
         }
+        acc += config.txn_mix.num_deletes;
+        if (percentage < acc)
+        {
+            return YcsbOpType::DELETE;
+        }
         return YcsbOpType::INSERT;
     };
 
@@ -265,6 +281,77 @@ void YcsbBenchmark::generateTxns()
     const uint32_t recent_window = config.recent_window_size;
     std::uniform_int_distribution<uint32_t> recent_offset_gen(
         0, recent_window > 0 ? recent_window - 1 : 0);
+
+    // Sliding-window generation for delete-bearing mixes (ycsbw). A
+    // separate branch so mixes without deletes keep the loop below
+    // bit-identical (its RNG stream backs the recovery anchors). Inserts
+    // mint keys at the head of the key space; each delete consumes the
+    // oldest live key from the tail; reads and updates draw from the live
+    // window [tail, head) only. Two passes per transaction: pass 1 fixes
+    // op types and the head/tail keys, so pass 2's window draws can never
+    // land on a key this transaction inserts or deletes, which keeps
+    // every delete terminal (no operation ordered after a delete ever
+    // touches its key, in this epoch or any later one).
+    if (config.txn_mix.num_deletes > 0)
+    {
+        uint32_t delete_tail = 0;
+        for (size_t epoch = 0; epoch < config.epochs; ++epoch)
+        {
+            logger.Info("Generating epoch {}", epoch);
+            for (size_t t = 0; t < config.num_txns; ++t)
+            {
+                BaseTxn *base_txn = txn_array[epoch].getTxn(t);
+                YcsbTxn *txn = reinterpret_cast<YcsbTxn *>(base_txn->data);
+                for (size_t op = 0; op < config.num_ops_per_txn; ++op)
+                {
+                    txn->ops[op] = getOpType(percentage_gen(gen));
+                    if (txn->ops[op] == YcsbOpType::INSERT)
+                    {
+                        txn->keys[op] = max_existing_record++;
+                    }
+                    else if (txn->ops[op] == YcsbOpType::DELETE)
+                    {
+                        if (delete_tail >= max_existing_record)
+                        {
+                            throw std::runtime_error(
+                                "ycsb delete generation drained the live window; "
+                                "the delete rate must not exceed insert rate + initial population");
+                        }
+                        txn->keys[op] = delete_tail++;
+                    }
+                    else
+                    {
+                        txn->keys[op] = 0xffffffffu;  // drawn in pass 2
+                    }
+                }
+                for (size_t op = 0; op < config.num_ops_per_txn; ++op)
+                {
+                    if (txn->ops[op] == YcsbOpType::INSERT || txn->ops[op] == YcsbOpType::DELETE)
+                    {
+                        continue;
+                    }
+                    bool retry;
+                    do
+                    {
+                        const uint32_t window = max_existing_record - delete_tail;
+                        const uint32_t rank = static_cast<uint32_t>(zipf.next()) % window;
+                        txn->keys[op] = max_existing_record - 1u - rank;  // hot end = newest live keys
+                        retry = false;
+                        for (size_t j = 0; j < config.num_ops_per_txn; ++j)
+                        {
+                            if (j != op && txn->keys[j] == txn->keys[op])
+                            {
+                                retry = true;
+                                break;
+                            }
+                        }
+                    } while (retry);
+                    txn->fields[op] = field_gen(gen);
+                }
+            }
+        }
+        return;
+    }
 
     for (size_t epoch = 0; epoch < config.epochs; ++epoch)
     {
@@ -416,6 +503,17 @@ void YcsbBenchmark::runEpoch(uint32_t epoch_id, FlushHandle& flush_inflight)
 
             start_time = std::chrono::high_resolution_clock::now();
             {
+                // Flag this epoch's deleted records' cache slots
+                // reclaim-first before eviction runs. Safe within the
+                // deleting epoch itself: any slot the epoch still touches
+                // is needed-protected, and a slot with an in-flight
+                // writeback is pinned, so the flag only accelerates
+                // draining slots nothing needs anymore.
+                if (config.txn_mix.num_deletes > 0) {
+                    if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) {
+                        stager->mark_reclaimable(gi->deleteCridsDevice(), gi->numDeletesThisEpoch());
+                    }
+                }
                 // Pass flush handle so scatter can be spawned after SG transfer
                 FlushHandle* fh = (config.overlap_flush && flush_inflight.valid) ? &flush_inflight : nullptr;
                 stager->prepareEpoch(epoch_id,
@@ -591,16 +689,33 @@ void YcsbBenchmark::runBenchmark()
                         "falling back to full replay from epoch 1", E);
         } else {
             const uint32_t f_e2 = cursors->free_start_p2;  // insert cursor at end-of-(E-2)
+            const uint32_t d_e2 = cursors->del_p2;         // delete cursor at end-of-(E-2)
             logger.Info("[RECOVER] crash marker E={}; roll back to end-of-({}) (f_(E-2)={}), resume at epoch {}",
                         E, static_cast<int>(E) - 2, f_e2, E - 1);
             // 1) Demote the Primary Store's dual-version tags to end-of-(E-2).
             rollbackPrimaryStoreVersions(E - 1);
-            // 2) Rebuild the INSERT index at end-of-(E-2): reconstruct the
-            //    shadow shards from the durable insert-keys array, then upload to
-            //    the GPU cuco map (which also sets free_start = f_(E-2)). YCSB-F
-            //    has no inserts so both are no-ops (f_e2==0).
-            if (cpu_shadow_) cpu_shadow_->reconstructInsertsFromDurable(f_e2);
-            if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) gi->rebuildCucoFromShadow(f_e2);
+            // 2) Rebuild the index at end-of-(E-2): reconstruct the shadow
+            //    shards from the durable insert-keys array, apply the durable
+            //    delete log through d_(E-2) (deletes from E-1 and E are beyond
+            //    the cursor, so their keys come back live and replay re-erases
+            //    them), then upload to the GPU cuco map (which also resyncs
+            //    both cursors). YCSB-F has no inserts or deletes so all three
+            //    are no-ops.
+            if (cpu_shadow_) {
+                cpu_shadow_->reconstructInsertsFromDurable(f_e2);
+                cpu_shadow_->applyDeletesFromDurable(d_e2);
+#ifdef EGAD_VALIDATION
+                // Liveness gate, reconstruction side: the shards must equal
+                // an independent replay of the logs to the same cursors. A
+                // lost or extra delete application is invisible to the store
+                // byte hashes (deletes write no record bytes); this check is
+                // what catches it.
+                if (config.txn_mix.num_deletes > 0) {
+                    cpu_shadow_->verifyLiveAgainstLogs(f_e2, d_e2);
+                }
+#endif // EGAD_VALIDATION
+            }
+            if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) gi->rebuildCucoFromShadow(f_e2, d_e2);
             start_epoch = E - 1;
         }
     }
@@ -680,6 +795,15 @@ void YcsbBenchmark::runBenchmark()
                                hashCpuRecords());
     Logger::GetInstance().Info("[STATE-HASH-VALONLY] cpu_records placement-invariant = 0x{:016x}",
                                hashCpuRecordsValOnly());
+    // Liveness gate, end-of-run side: digest of the live key->CRID mapping
+    // derived from the durable logs. Deletes write no record bytes, so the
+    // two store hashes above cannot distinguish a live key from a deleted
+    // one; this line can. Durable runs only (the logs are the source).
+    if (config.txn_mix.num_deletes > 0 && cpu_shadow_
+        && (std::getenv("EPIC_DURABLE_STORE") || std::getenv("EPIC_RECOVER_FROM"))) {
+        Logger::GetInstance().Info("[STATE-HASH-LIVE] ycsb live-mapping = 0x{:016x}",
+                                   cpu_shadow_->liveDigestFromLogs(currentInsertCount(), currentDeleteCount()));
+    }
 #endif // EGAD_VALIDATION
     verifyInsertedRecords();
 }
@@ -727,7 +851,8 @@ void YcsbBenchmark::initGpuHybridStagerExecutor()
         GPU_records, GPU_versions, CPU_records,
         config.gpu_capacity,
         static_cast<uint32_t>(num_units),
-        config.split_field);
+        config.split_field,
+        /*enable_reclaim_eviction=*/config.txn_mix.num_deletes > 0);
 
     executor = std::make_shared<HybridExecutor>(
         GPU_records, GPU_versions,

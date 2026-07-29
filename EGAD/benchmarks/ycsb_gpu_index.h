@@ -31,13 +31,25 @@ public:
     // context, passing the last-known committed free_start. Only entries
     // whose assigned CRID is < starting_num_records + current_free_start are
     // uploaded; any future CRIDs (speculatively pre-computed and never used)
-    // are skipped. Must NOT be called concurrently with any other GPU activity.
-    void rebuildCucoFromShadow(uint32_t current_free_start);
+    // are skipped. current_delete_count resyncs the delete cursor so replay
+    // re-appends the delete log at the same positions. Must NOT be called
+    // concurrently with any other GPU activity.
+    void rebuildCucoFromShadow(uint32_t current_free_start, uint32_t current_delete_count = 0);
 
     // Total number of insert CRIDs allocated since startup. Equal to the
     // free-list cursor (free_start). Inserted CRIDs occupy the dense range
     // [starting_num_records, starting_num_records + getInsertCount()).
     uint32_t getInsertCount() const;
+
+    // Total number of deletes applied since startup (the delete-log cursor).
+    uint32_t getDeleteCount() const;
+
+    // This epoch's deleted CRIDs (device pointer + count), valid until the
+    // next indexTxns call. The stager marks these cache slots
+    // reclaim-first before its eviction pass. Count is 0 for mixes
+    // without deletes.
+    const uint32_t* deleteCridsDevice() const;
+    uint32_t numDeletesThisEpoch() const;
 };
 
 } // namespace epic::ycsb

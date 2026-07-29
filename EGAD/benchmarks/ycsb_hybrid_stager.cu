@@ -30,6 +30,7 @@
 #include <cstring>
 #include <numa.h>
 #include "numa_affinity.h"
+#include "reclaim_flags.cuh"
 
 static void pin_current_thread_to_node1_cores()
 {
@@ -344,7 +345,8 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
     HybridStager::HybridStager(Allocator& alloc,
                                YcsbRecordArrType GPU_records, YcsbVersionArrType GPU_versions,
                                YcsbRecordArrType CPU_records,
-                               uint32_t gpu_capacity, uint32_t num_units, bool split_field)
+                               uint32_t gpu_capacity, uint32_t num_units, bool split_field,
+                               bool enable_reclaim_eviction)
         : alloc_(alloc),
           split_field_(split_field),
           GPU_records_(GPU_records),
@@ -476,6 +478,15 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
 
         d_flush_pinned_flag_ = static_cast<uint8_t*>(alloc_.Allocate(gpu_capacity_ * sizeof(uint8_t)));
         gpu_err_check(cudaMemset(d_flush_pinned_flag_, 0, gpu_capacity_ * sizeof(uint8_t)));
+
+        // Reclaim-first eviction (delete-bearing mixes only): per-slot flag,
+        // set by mark_reclaimable, drained by the eviction pre-pass.
+        reclaim_eviction_active_ = enable_reclaim_eviction;
+        if (reclaim_eviction_active_) {
+            logger.Info("  reclaim-first eviction ENABLED for this stager");
+            d_reclaim_flag_ = static_cast<uint8_t*>(alloc_.Allocate(gpu_capacity_ * sizeof(uint8_t)));
+            gpu_err_check(cudaMemset(d_reclaim_flag_, 0, gpu_capacity_ * sizeof(uint8_t)));
+        }
 
         // Pre-allocated scratch buffers for prepareEpoch (avoid cudaMalloc/cudaFree per epoch)
         d_scratch_a_ = static_cast<uint32_t*>(alloc_.Allocate(sizeof(uint32_t) * gpu_capacity_));
@@ -941,6 +952,18 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                     GpuTimer tg("fifo:collect_evictions(gpu)");
                     constexpr int B = 256;
                     int G = 256;
+                    // Reclaim-first pre-pass (delete-bearing mixes): drain
+                    // flagged dead slots first, sharing d_cnt with the FIFO
+                    // scan below, which tops up whatever remains.
+                    if (reclaim_eviction_active_) {
+                        k_collect_evictions_reclaim_first<<<G, B>>>(gpu_capacity_,
+                                                            d_resident_list_, d_needed_grid_flag_,
+                                                            d_flush_pinned_flag_, d_reclaim_flag_,
+                                                            deficit,
+                                                            d_evict_grids, d_evict_crids,
+                                                            d_cnt);
+                        gpu_err_check(cudaPeekAtLastError());
+                    }
                     // Note that we pass in d_flush_pinned_flag regardless of whether its flush_overlap_enabled
                     // Because even if its not, its just 0s and we are just ||ing it in the kernel.
                     k_fifo_collect_evictions<<<G, B>>>(fifo_next_grid_, gpu_capacity_,
@@ -993,6 +1016,15 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                             GpuTimer tg("fifo:collect_evictions_retry(gpu)");
                             constexpr int B = 256;
                             int G = 256;
+                            if (reclaim_eviction_active_) {
+                                k_collect_evictions_reclaim_first<<<G, B>>>(gpu_capacity_,
+                                                                    d_resident_list_, d_needed_grid_flag_,
+                                                                    d_flush_pinned_flag_, d_reclaim_flag_,
+                                                                    deficit,
+                                                                    d_evict_grids, d_evict_crids,
+                                                                    d_cnt);
+                                gpu_err_check(cudaPeekAtLastError());
+                            }
                             k_fifo_collect_evictions<<<G, B>>>(fifo_next_grid_, gpu_capacity_,
                                                                 d_resident_list_, d_needed_grid_flag_,
                                                                 d_flush_pinned_flag_,
@@ -1051,6 +1083,14 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                     int grid = (deficit + block - 1) / block;
                     k_set_grid2crid<<<grid, block>>>(d_evict_grids, d_new_first, deficit, d_resident_list_);
                     gpu_err_check(cudaPeekAtLastError());
+                    // The renamed slots have new occupants; clear their
+                    // reclaim flag so a stale flag does not drain the new
+                    // resident on the next sweep.
+                    if (reclaim_eviction_active_) {
+                        k_clear_reclaim_by_grids<<<grid, block>>>(
+                            d_evict_grids, deficit, gpu_capacity_, d_reclaim_flag_);
+                        gpu_err_check(cudaPeekAtLastError());
+                    }
         gpu_err_check(cudaStreamSynchronize(0));
                 }
 
@@ -1461,6 +1501,18 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         }
     }
 
+    void HybridStager::mark_reclaimable(const uint32_t* d_crids, uint32_t n)
+    {
+        if (!reclaim_eviction_active_ || n == 0 || d_crids == nullptr) return;
+        auto dv = crid2grid_index_.device_view();
+        constexpr int B = 256;
+        int G = (n + B - 1) / B;
+        k_mark_reclaim_by_crids<<<G, B>>>(d_crids, n,
+            dv.d_crid_to_grid, dv.num_units, gpu_capacity_, d_reclaim_flag_);
+        gpu_err_check(cudaPeekAtLastError());
+        gpu_err_check(cudaStreamSynchronize(0));
+    }
+
     void HybridStager::set_flush_pins_for_next_epoch(const FlushHandle* inflight)
     {
         // Clear pins from previous epoch
@@ -1861,6 +1913,7 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         free_alloc(reinterpret_cast<void*&>(d_new_insert_count_));
 
         free_cuda(reinterpret_cast<void*&>(d_flush_pinned_flag_));
+        free_alloc(reinterpret_cast<void*&>(d_reclaim_flag_));
 
         if (h_evict_crids_) { cudaFreeHost(h_evict_crids_); h_evict_crids_ = nullptr; }
         if (h_evict_grids_) { cudaFreeHost(h_evict_grids_); h_evict_grids_ = nullptr; }

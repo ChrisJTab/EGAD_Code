@@ -149,6 +149,14 @@ uint32_t YcsbBenchmark::currentInsertCount() const
     return gpu_index_ptr ? gpu_index_ptr->getInsertCount() : 0u;
 }
 
+// Current delete-log cursor; the insert cursor's dual. 0 for mixes
+// without deletes.
+uint32_t YcsbBenchmark::currentDeleteCount() const
+{
+    auto* gpu_index_ptr = dynamic_cast<YcsbGpuIndex*>(index.get());
+    return gpu_index_ptr ? gpu_index_ptr->getDeleteCount() : 0u;
+}
+
 // Advance the durable crash marker + shift the insert-cursor
 // history. Called once per epoch at the end of runEpoch(E), after sync_flush
 // has retired E-1 and before E's writeback is started -- the one point where
@@ -165,10 +173,13 @@ void YcsbBenchmark::bumpRecoveryMarker(uint32_t crash_epoch)
 {
     if (!recovery_meta_) return;
     const uint32_t insert_count = currentInsertCount();
+    const uint32_t delete_count = currentDeleteCount();
     const uint64_t word = recovery_meta_->prepare(crash_epoch,
         [&](YcsbRecoveryCursors& nb, const YcsbRecoveryCursors* ob) {
             nb.free_start_p2 = ob ? ob->free_start_p1 : 0u;
             nb.free_start_p1 = insert_count;
+            nb.del_p2 = ob ? ob->del_p1 : 0u;
+            nb.del_p1 = delete_count;
         });
 #ifdef EGAD_VALIDATION
     maybeTearMarkerAt(crash_epoch);

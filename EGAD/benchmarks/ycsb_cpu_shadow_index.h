@@ -81,14 +81,45 @@ public:
     // mirrorEpoch's allocation. Used in a fresh process before rebuildCucoFromShadow.
     void reconstructInsertsFromDurable(uint32_t count);
 
+    // Per-epoch delete mirror, the dual of mirrorEpoch. Appends this
+    // epoch's delete keys (already D2H'd into h_delete_keys()) to the
+    // durable delete log at [old_delete_count, old_delete_count+n).
+    void mirrorEpochDeletes(uint32_t num_deletes, uint32_t old_delete_count);
+
+    // Recover-mode: apply the first `count` durable delete-log entries to
+    // the shards (erase each key). Runs after reconstructInsertsFromDurable,
+    // so a key inserted and later deleted (both at or before the rollback
+    // cursor) ends absent. Deletes are terminal (no key is re-inserted), so
+    // the two passes need no interleaving by epoch.
+    void applyDeletesFromDurable(uint32_t count);
+
+#ifdef EGAD_VALIDATION
+    // Order-independent digest of the live key->CRID mapping derived from
+    // the durable logs alone (initial population + first ins_count insert
+    // entries minus first del_count delete entries). The recovery liveness
+    // gate: byte hashes of the Primary Store cannot see a wrongly revived
+    // key because a delete writes no record bytes, so the gate digests the
+    // mapping instead. 0 when not in durable mode.
+    uint64_t liveDigestFromLogs(uint32_t ins_count, uint32_t del_count) const;
+
+    // Recover-time self-consistency check: the same digest computed over
+    // the reconstructed shards must equal liveDigestFromLogs at the
+    // rollback cursors. Catches log-application bugs (e.g. a lost delete)
+    // that end-of-run log digests alone cannot. Logs [LIVE-CHECK] PASS or
+    // FAILED; does not throw, so a failing run still completes for
+    // diagnosis.
+    void verifyLiveAgainstLogs(uint32_t ins_count, uint32_t del_count) const;
+#endif // EGAD_VALIDATION
+
     // Read access for the GPU index's smoke check + rebuild upload path.
     const std::array<Shard, kShards>& shards() const { return shards_; }
 
-    // Pinned host buffer consumed by the per-epoch mirror. Owned here
-    // because it is sized to the shadow's needs and read only by
-    // mirrorEpoch. YcsbGpuIndex::indexTxns issues the D2H into this
-    // buffer and then calls mirrorEpoch.
+    // Pinned host buffers consumed by the per-epoch mirrors. Owned here
+    // because they are sized to the shadow's needs and read only by
+    // mirrorEpoch / mirrorEpochDeletes. YcsbGpuIndex::indexTxns issues
+    // the D2H into these buffers and then calls the mirror.
     uint32_t* h_insert_keys() { return h_insert_keys_; }
+    uint32_t* h_delete_keys() { return h_delete_keys_; }
 
     // Static accessors so external callers (the GPU index) can use the
     // same shard count and a matching shard() lookup helper.
@@ -106,11 +137,21 @@ private:
     // Pinned host buffer for per-epoch D2H of insert keys.
     uint32_t* h_insert_keys_ = nullptr;
 
+    // Pinned host buffer for per-epoch D2H of delete keys. Allocated only
+    // for delete-bearing mixes.
+    uint32_t* h_delete_keys_ = nullptr;
+
     // Durable (mmap-backed when EPIC_DURABLE_STORE/RECOVER_FROM)
     // append-only array of insert keys, indexed by (CRID - starting_num_records).
     // mirrorEpoch appends each epoch; recover rebuilds the shards from it. null
     // when not in durable mode (normal/throughput path -> no allocation/overhead).
     uint32_t* durable_insert_keys_ = nullptr;
+
+    // Durable append-only array of delete keys, indexed by cumulative
+    // delete count; the dual of durable_insert_keys_. A key is deleted at
+    // most once (deletes are terminal), so the log is bounded by the total
+    // key universe. null when not in durable mode or the mix has no deletes.
+    uint32_t* durable_delete_keys_ = nullptr;
 };
 
 } // namespace epic::ycsb
