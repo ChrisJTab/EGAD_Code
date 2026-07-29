@@ -515,6 +515,16 @@ void TpccDb::runEpoch(uint32_t epoch_id)
                     fh);
                 logger.Info("[INV-TL] epoch={} stager={} phase=prepareEpoch event=end", epoch_id, name);
             };
+            // Flag this epoch's deleted NewOrder rows' cache slots
+            // reclaim-first before eviction runs (single-threaded region,
+            // before the parallel sections). Safe within the deleting
+            // epoch: any slot the epoch still touches is needed-protected,
+            // and a slot with an in-flight writeback is pinned.
+            if (config.txn_mix.delivery > 0) {
+                if (auto* gi = dynamic_cast<TpccGpuIndex<TpccTxnArrayT, TpccTxnParamArrayT>*>(index.get())) {
+                    new_order_stager->mark_reclaimable(gi->noDeleteCridsDevice(), gi->numNoDeletesThisEpoch());
+                }
+            }
             // The 8 stagers prepare concurrently, each on its own
             // prep_stream_ (created in the TpccHybridStager constructor).
             static const bool kPrepEpochParallel = true;
@@ -939,6 +949,7 @@ void TpccDb::runBenchmark()
                         "falling back to full replay from epoch 1", E);
         } else {
             const TpccFreeStarts f_e2{ cursors->no_p2, cursors->o_p2, cursors->ol_p2 };  // f_{E-2}
+            const uint32_t no_d_e2 = cursors->no_d_p2;  // NO delete cursor at end-of-(E-2)
             logger.Info("[RECOVER] crash marker E={}; roll back to end-of-({}) "
                         "(f_(E-2): NO={} O={} OL={}), resume at epoch {}",
                         E, static_cast<int>(E) - 2,
@@ -959,8 +970,21 @@ void TpccDb::runBenchmark()
             // 1) Demote the Primary Store's dual-version tags to end-of-(E-2).
             rollbackPrimaryStoreVersions(E - 1, full_extent);
             // 2) Reconstruct the runtime insert shadows from the durable key
-            //    arrays (layered on the initial-pop shadow loadInitialData built).
+            //    arrays (layered on the initial-pop shadow loadInitialData
+            //    built), then apply the NO delete log through d_(E-2).
+            //    Deletes from E-1 and E are beyond the cursor, so their NO
+            //    rows come back live and replay re-erases them.
             cpu_shadow_->reconstructInsertsFromDurable(f_e2);
+            cpu_shadow_->applyNoDeletesFromDurable(no_d_e2);
+#ifdef EGAD_VALIDATION
+            // Liveness gate, reconstruction side: the NO shadow must equal
+            // an independent replay of the logs to the same cursors. A lost
+            // or extra delete application changes no store bytes, so only
+            // this check can see it.
+            if (config.txn_mix.delivery > 0) {
+                cpu_shadow_->verifyNoLiveAgainstLogs(f_e2.new_order, no_d_e2);
+            }
+#endif // EGAD_VALIDATION
             // 3) Rebuild the aux index from the shadow. Recreate it FRESH first:
             //    main.cpp's loadInitialData() already built the aux, and
             //    rebuildFromShadow calls loadInitialData() internally, so reusing
@@ -974,7 +998,7 @@ void TpccDb::runBenchmark()
                                              cpu_records.order_line_record);
             // 4) Rebuild the primary index/cache from the shadow.
             if (auto* gi = dynamic_cast<TpccGpuIndex<TpccTxnArrayT, TpccTxnParamArrayT>*>(index.get())) {
-                gi->rebuildIndexesFromShadow(f_e2);
+                gi->rebuildIndexesFromShadow(f_e2, no_d_e2);
             }
             logger.Info("[RECOVER] rebuild complete; resuming at epoch {}", E - 1);
             start_epoch = E - 1;
@@ -1035,6 +1059,19 @@ void TpccDb::runBenchmark()
         corruptPrimaryStoreForNegControl();   // no-op unless neg-control env set
         logger.Info("[STATE-HASH] tpcc cpu_records FNV-1a 64-bit = 0x{:016x}", hashCpuRecords());
         logCpuRecordsTableHashes();
+        // Liveness gate, end-of-run side: digest of the live NewOrder
+        // key->CRID mapping derived from the durable logs. Deletes write
+        // no record bytes, so the store hashes above cannot distinguish a
+        // live NO row from a delivered one; this line can. Durable runs
+        // only (the logs are the source).
+        if (config.txn_mix.delivery > 0 && cpu_shadow_
+            && (std::getenv("EPIC_DURABLE_STORE") || std::getenv("EPIC_RECOVER_FROM"))) {
+            if (auto* gi = dynamic_cast<TpccGpuIndex<TpccTxnArrayT, TpccTxnParamArrayT>*>(index.get())) {
+                logger.Info("[STATE-HASH-LIVE] tpcc NO live-mapping = 0x{:016x}",
+                            cpu_shadow_->noLiveDigestFromLogs(gi->getInsertCounts().new_order,
+                                                              gi->getNoDeleteCount()));
+            }
+        }
     }
 #endif // EGAD_VALIDATION
 
@@ -1102,17 +1139,19 @@ void TpccDb::initGpuStagersAndWireDirty()
         static_cast<uint32_t>(config.cacheCapacityStock()),      static_cast<uint32_t>(config.stockTableSize()));
     new_order_stager  = std::make_shared<NewOrderStager>(*hybrid_allocator,
         records.new_order_record,  versions.new_order_version,  cpu_records.new_order_record,
-        static_cast<uint32_t>(config.cacheCapacityNewOrder()),   static_cast<uint32_t>(config.newOrderTableSize()));
+        static_cast<uint32_t>(config.cacheCapacityNewOrder()),   static_cast<uint32_t>(config.newOrderTableSize()),
+        /*enable_reclaim_eviction=*/config.txn_mix.delivery > 0);
     order_stager      = std::make_shared<OrderStager>(*hybrid_allocator,
         records.order_record,      versions.order_version,      cpu_records.order_record,
         static_cast<uint32_t>(config.cacheCapacityOrder()),      static_cast<uint32_t>(config.orderTableSize()));
     order_line_stager = std::make_shared<OrderLineStager>(*hybrid_allocator,
         records.order_line_record, versions.order_line_version, cpu_records.order_line_record,
         static_cast<uint32_t>(config.cacheCapacityOrderLine()),  static_cast<uint32_t>(config.orderLineTableSize()),
-        /*enable_delivery_aware_eviction=*/true);
-    // Plumb the OL delivered-flag pointer into TpccRecords so the
-    // hybrid Delivery executor can mark slots after writing OL_DELIVERY_D.
-    records.order_line_delivered_flag = order_line_stager->delivered_flag_ptr();
+        /*enable_reclaim_eviction=*/true);
+    // Plumb the OL reclaim-flag pointer into TpccRecords so the hybrid
+    // Delivery executor can mark slots delivered (= reclaimable) after
+    // writing OL_DELIVERY_D.
+    records.order_line_delivered_flag = order_line_stager->reclaim_flag_ptr();
 
     // Plumb each stager's per-slot dirty arrays into TpccRecords so the
     // executor's gpuWriteToTableCoop / gpuWriteToTableThread can mark

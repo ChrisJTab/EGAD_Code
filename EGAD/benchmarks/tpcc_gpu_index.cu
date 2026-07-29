@@ -690,6 +690,50 @@ __global__ void indexTpccTxnKernel(
     }
 }
 
+// Emit the epoch's NewOrder delete set. Delivery consumes each NewOrder
+// row exactly once, so every delivered (w, d, o) is a delete: for each
+// Delivery transaction's non-empty district, write the packed NO key and
+// its resolved CRID (from the params the indexing kernel just filled)
+// into per-slot arrays and raise the slot's flag. DeviceSelect::Flagged
+// compacts key and CRID arrays with the same flags, preserving slot
+// order, so the durable delete log's append order is deterministic.
+template <typename GpuTxnArrayType, typename GpuTxnIndexArrayType>
+__global__ void prepareTpccNoDeleteKernel(GpuTxnArrayType txn, GpuTxnIndexArrayType index,
+    NewOrderKey::baseType *keys, uint32_t *crids, uint8_t *flags, uint32_t num_txns)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_txns)
+    {
+        return;
+    }
+    BaseTxn *txn_ptr = txn.getTxn(tid);
+    int base = tid * 10;
+    if (static_cast<TpccTxnType>(txn_ptr->txn_type) != TpccTxnType::DELIVERY)
+    {
+        for (int i = 0; i < 10; ++i)
+        {
+            flags[base + i] = 0;
+        }
+        return;
+    }
+    DeliveryTxnInput *input = reinterpret_cast<DeliveryTxnInput *>(txn_ptr->data);
+    DeliveryTxnParams *params = reinterpret_cast<DeliveryTxnParams *>(index.getTxn(tid)->data);
+    for (int i = 0; i < 10; ++i)
+    {
+        const bool delivers = input->o_id[i] != 0;
+        flags[base + i] = delivers ? 1 : 0;
+        if (delivers)
+        {
+            NewOrderKey key;
+            key.no_o_id = input->o_id[i];
+            key.no_d_id = i + 1;
+            key.no_w_id = input->w_id;
+            keys[base + i] = key.base_key;
+            crids[base + i] = params->new_order_id[i];
+        }
+    }
+}
+
 template<typename InputType>
 class DummyPredicate
 {
@@ -724,6 +768,14 @@ public:
     static constexpr cuco::empty_key<StockKey::baseType> stock_key_sentinel{static_cast<StockKey::baseType>(-1)};
 
     static constexpr cuco::empty_value<uint32_t> value_sentinel{static_cast<uint32_t>(-1)};
+
+    // Erased-slot sentinel for the NewOrder map, the one TPC-C table with
+    // deletes (Delivery consumes each NewOrder row exactly once). Passed
+    // at BOTH construction sites (ctor and the recovery rebuild); cuco's
+    // erase throws at runtime on a map built without it. Outside the key
+    // universe: real packed keys leave the upper bits zero.
+    static constexpr cuco::erased_key<NewOrderKey::baseType> new_order_erased_sentinel{
+        static_cast<NewOrderKey::baseType>(-2)};
 
     TpccConfig tpcc_config;
 
@@ -771,6 +823,21 @@ public:
     void *d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
 
+    // NewOrder delete-set scratch, allocated only when the mix includes
+    // Delivery (nullptr otherwise; the delete block never runs then).
+    // Per-slot key/CRID arrays + flags, their Flagged-compacted outputs,
+    // a mapped count, and the cumulative NO delete-log cursor.
+    NewOrderKey::baseType *d_no_deletes = nullptr, *d_no_valid_deletes = nullptr;
+    uint32_t *d_no_delete_crids = nullptr, *d_no_valid_delete_crids = nullptr;
+    uint8_t *d_no_delete_flags = nullptr;
+    thrust::device_ptr<NewOrderKey::baseType> dp_no_valid_deletes;
+    uint32_t *d_num_no_delete = nullptr;   // mapped device pointer
+    uint32_t *h_num_no_delete = nullptr;   // mapped host pointer (same memory)
+    uint32_t no_delete_count = 0;          // cumulative; the durable NO delete-log cursor
+    uint32_t num_no_deletes_this_epoch = 0;
+    void *d_no_flagged_temp = nullptr;
+    size_t no_flagged_temp_bytes = 0;
+
     // Flat OL index. When EPIC_FLAT_INDEX_OL=1, allocate
     // a uint32_t flat array sized to W * 10 * max_o * 15 entries instead
     // of (or alongside) the cuco hash map. Cuco is allocated at a tiny
@@ -810,7 +877,7 @@ public:
               value_sentinel)}
         , new_order_index{std::make_shared<NewOrderIndexType>(
               static_cast<size_t>(std::ceil(tpcc_config.newOrderTableSize() / load_factor)), new_order_key_sentinel,
-              value_sentinel)}
+              value_sentinel, new_order_erased_sentinel)}
         , order_index{std::make_shared<OrderIndexType>(
               static_cast<size_t>(std::ceil(tpcc_config.orderTableSize() / load_factor)), order_key_sentinel,
               value_sentinel)}
@@ -892,6 +959,27 @@ public:
         temp_storage_bytes = max_bytes;
         logger.Trace("Allocating {} bytes for temp storage", formatSizeBytes(temp_storage_bytes));
         gpu_err_check(cudaMalloc(&d_temp_storage, temp_storage_bytes));
+
+        // NewOrder delete-set scratch, Delivery-bearing mixes only.
+        if (tpcc_config.txn_mix.delivery > 0) {
+            const size_t n_slots = static_cast<size_t>(tpcc_config.num_txns) * 10;
+            gpu_err_check(cudaMalloc(&d_no_deletes, sizeof(NewOrderKey::baseType) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_valid_deletes, sizeof(NewOrderKey::baseType) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_delete_crids, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_valid_delete_crids, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_delete_flags, sizeof(uint8_t) * n_slots));
+            dp_no_valid_deletes = thrust::device_pointer_cast(d_no_valid_deletes);
+            gpu_err_check(cudaHostAlloc(&h_num_no_delete, sizeof(uint32_t), cudaHostAllocMapped));
+            *h_num_no_delete = 0;
+            gpu_err_check(cudaHostGetDevicePointer(&d_num_no_delete, h_num_no_delete, 0));
+            size_t key_bytes = 0, crid_bytes = 0;
+            cub::DeviceSelect::Flagged(nullptr, key_bytes,
+                d_no_deletes, d_no_delete_flags, d_no_valid_deletes, d_num_no_delete, n_slots);
+            cub::DeviceSelect::Flagged(nullptr, crid_bytes,
+                d_no_delete_crids, d_no_delete_flags, d_no_valid_delete_crids, d_num_no_delete, n_slots);
+            no_flagged_temp_bytes = std::max(key_bytes, crid_bytes);
+            gpu_err_check(cudaMalloc(&d_no_flagged_temp, no_flagged_temp_bytes));
+        }
 
         // CPU shadow allocation now lives in TpccCpuShadowIndex's ctor
         // (host-side, owned by TpccDb). This class just holds a reference.
@@ -1224,6 +1312,44 @@ public:
             GpuPackedTxnArray(txn_array), GpuTxnArrayType(index_array), index_device_view, tpcc_config.num_txns);
         gpu_err_check(cudaPeekAtLastError());
         gpu_err_check(cudaDeviceSynchronize());
+
+        // NewOrder delete application, after this epoch's lookups so every
+        // transaction of the epoch still resolves its NO rows
+        // (epoch-boundary visibility). Emits the slot-ordered delete set
+        // from the Delivery inputs and the CRIDs the kernel above
+        // resolved, erases the keys from the NO map, and appends them to
+        // the durable delete log. The compacted CRID list stays on device
+        // for the NO stager's reclaim-first marking.
+        if (tpcc_config.txn_mix.delivery > 0) {
+            const size_t n_slots = static_cast<size_t>(tpcc_config.num_txns) * 10;
+            prepareTpccNoDeleteKernel<<<(tpcc_config.num_txns + block_size - 1) / block_size, block_size>>>(
+                GpuPackedTxnArray(txn_array), GpuTxnArrayType(index_array),
+                d_no_deletes, d_no_delete_crids, d_no_delete_flags, tpcc_config.num_txns);
+            gpu_err_check(cudaPeekAtLastError());
+            {
+                size_t tmp = no_flagged_temp_bytes;
+                cub::DeviceSelect::Flagged(d_no_flagged_temp, tmp,
+                    d_no_deletes, d_no_delete_flags, d_no_valid_deletes, d_num_no_delete, n_slots);
+            }
+            {
+                size_t tmp = no_flagged_temp_bytes;
+                cub::DeviceSelect::Flagged(d_no_flagged_temp, tmp,
+                    d_no_delete_crids, d_no_delete_flags, d_no_valid_delete_crids, d_num_no_delete, n_slots);
+            }
+            gpu_err_check(cudaStreamSynchronize(0));
+            const uint32_t num_no_deletes = *h_num_no_delete;
+            num_no_deletes_this_epoch = num_no_deletes;
+            logger.Info("Found {} new order deletes", num_no_deletes);
+            if (num_no_deletes > 0) {
+                new_order_index->erase(dp_no_valid_deletes, dp_no_valid_deletes + num_no_deletes);
+                gpu_err_check(cudaStreamSynchronize(0));
+                gpu_err_check(cudaMemcpy(
+                    shadow_.h_no_delete_keys(), d_no_valid_deletes,
+                    num_no_deletes * sizeof(NewOrderKey::baseType), cudaMemcpyDeviceToHost));
+                shadow_.mirrorEpochNoDeletes(num_no_deletes, no_delete_count);
+                no_delete_count += num_no_deletes;
+            }
+        }
         logger.Info("Finished indexing transactions");
     }
 
@@ -1293,10 +1419,15 @@ public:
         logger.Info("[SHADOW-REBUILD] {} uploaded {} entries", name, h_keys.size());
     }
 
-    void rebuildIndexesFromShadow(TpccFreeStarts current)
+    void rebuildIndexesFromShadow(TpccFreeStarts current, uint32_t current_no_delete_count)
     {
         auto &logger = Logger::GetInstance();
         gpu_err_check(cudaStreamSynchronize(0));
+        // Resync the NO delete-log cursor to the rollback point so
+        // replay's re-applied deletes overwrite the log tail at the same
+        // positions.
+        no_delete_count = current_no_delete_count;
+        num_no_deletes_this_epoch = 0;
         logger.Info("[SHADOW-REBUILD] starting: NO={} O={} OL={}",
                     current.new_order, current.order, current.order_line);
 
@@ -1346,7 +1477,7 @@ public:
             stock_key_sentinel, value_sentinel);
         new_order_index = std::make_shared<NewOrderIndexType>(
             static_cast<size_t>(std::ceil(tpcc_config.newOrderTableSize() / load_factor)),
-            new_order_key_sentinel, value_sentinel);
+            new_order_key_sentinel, value_sentinel, new_order_erased_sentinel);
         order_index = std::make_shared<OrderIndexType>(
             static_cast<size_t>(std::ceil(tpcc_config.orderTableSize() / load_factor)),
             order_key_sentinel, value_sentinel);
@@ -1502,10 +1633,11 @@ void TpccGpuIndex<TxnArrayType, TxnParamArrayType>::indexTxns(
 }
 
 template <typename TxnArrayType, typename TxnParamArrayType>
-void TpccGpuIndex<TxnArrayType, TxnParamArrayType>::rebuildIndexesFromShadow(TpccFreeStarts current_free_starts)
+void TpccGpuIndex<TxnArrayType, TxnParamArrayType>::rebuildIndexesFromShadow(TpccFreeStarts current_free_starts,
+    uint32_t current_no_delete_count)
 {
     auto &impl = std::any_cast<TpccGpuIndexImpl<TxnArrayType, TxnParamArrayType, TpccGpuTxnArrayT> &>(gpu_index_impl);
-    impl.rebuildIndexesFromShadow(current_free_starts);
+    impl.rebuildIndexesFromShadow(current_free_starts, current_no_delete_count);
 }
 
 template <typename TxnArrayType, typename TxnParamArrayType>
@@ -1513,6 +1645,27 @@ TpccFreeStarts TpccGpuIndex<TxnArrayType, TxnParamArrayType>::getInsertCounts() 
 {
     auto const &impl = std::any_cast<TpccGpuIndexImpl<TxnArrayType, TxnParamArrayType, TpccGpuTxnArrayT> const &>(gpu_index_impl);
     return impl.getInsertCounts();
+}
+
+template <typename TxnArrayType, typename TxnParamArrayType>
+uint32_t TpccGpuIndex<TxnArrayType, TxnParamArrayType>::getNoDeleteCount() const
+{
+    auto const &impl = std::any_cast<TpccGpuIndexImpl<TxnArrayType, TxnParamArrayType, TpccGpuTxnArrayT> const &>(gpu_index_impl);
+    return impl.no_delete_count;
+}
+
+template <typename TxnArrayType, typename TxnParamArrayType>
+const uint32_t* TpccGpuIndex<TxnArrayType, TxnParamArrayType>::noDeleteCridsDevice() const
+{
+    auto const &impl = std::any_cast<TpccGpuIndexImpl<TxnArrayType, TxnParamArrayType, TpccGpuTxnArrayT> const &>(gpu_index_impl);
+    return impl.d_no_valid_delete_crids;
+}
+
+template <typename TxnArrayType, typename TxnParamArrayType>
+uint32_t TpccGpuIndex<TxnArrayType, TxnParamArrayType>::numNoDeletesThisEpoch() const
+{
+    auto const &impl = std::any_cast<TpccGpuIndexImpl<TxnArrayType, TxnParamArrayType, TpccGpuTxnArrayT> const &>(gpu_index_impl);
+    return impl.num_no_deletes_this_epoch;
 }
 
 template class TpccGpuIndex<TpccTxnArrayT, TpccTxnParamArrayT>;

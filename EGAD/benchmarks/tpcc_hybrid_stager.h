@@ -80,10 +80,16 @@ template <typename TRec, typename TVer>
 class TpccHybridStager
 {
 public:
+    // enable_reclaim_eviction activates the reclaim-first eviction pass
+    // (reclaim_flags.cuh): flagged logically-dead slots are drained before
+    // live residents. Two flag producers exist -- the Delivery executor
+    // marks delivered OrderLine slots directly through the plumbed flag
+    // pointer, and mark_reclaimable flags deleted NewOrder rows' slots --
+    // both feed the same per-slot flag and eviction pre-pass.
     TpccHybridStager(Allocator& alloc, TRec* GPU_records, TVer* GPU_versions,
         TRec* CPU_records,
         uint32_t gpu_capacity, uint32_t num_units,
-        bool enable_delivery_aware_eviction = false);
+        bool enable_reclaim_eviction = false);
 
     ~TpccHybridStager();
 
@@ -287,22 +293,23 @@ private:
     size_t    d_flush_sort_tmp_bytes_ = 0;
     bool      flush_sort_ready_ = false;
 
-    // Delivery-aware eviction (OL stager only). When enabled, every cache
-    // slot has a 1-bit flag indicating whether the order whose OL row lives
-    // there has been delivered. The constructor allocates the buffer, the
-    // Delivery executor sets it, and the eviction pass reads it.
-    bool      enable_delivery_aware_eviction_ = false;
-    // Runtime activation: set for stagers constructed with the feature
-    // enabled (the OL stager). Gates both the prefer-delivered eviction
-    // kernel and the post-rename flag-clear (without the clear, the flag
-    // would accumulate stale 1s and the eviction kernel would pick wrong
-    // victims).
-    bool      delivery_aware_eviction_active_ = false;
+    // Reclaim-first eviction. When enabled, every cache slot has a 1-byte
+    // flag marking its record as logically dead (a delivered OrderLine
+    // row, a deleted NewOrder row); the eviction pass drains flagged
+    // slots ahead of live residents, and renames clear the flag so a
+    // stale 1 never drains the slot's next occupant.
+    bool      reclaim_eviction_active_ = false;
 public:
-    // Public getter so tpcc.cpp can plumb the pointer into TpccRecords for
-    // the Delivery executor to write to. Returns nullptr if this stager did
-    // not enable delivery-aware eviction.
-    uint8_t* delivered_flag_ptr() const { return d_delivered_flag_; }
+    // Public getter so tpcc.cpp can plumb the pointer into TpccRecords
+    // for the Delivery executor to write to (delivered OL slots).
+    // Returns nullptr if this stager did not enable reclaim eviction.
+    uint8_t* reclaim_flag_ptr() const { return d_reclaim_flag_; }
+
+    // Flag the cache slots of a deleted-CRID list reclaim-first (the
+    // NewOrder stager's producer; Delivery's OL marking goes through the
+    // plumbed flag pointer instead). No-op when reclaim eviction is
+    // disabled or n is 0.
+    void mark_reclaimable(const uint32_t* d_crids, uint32_t n);
 
     // Per-slot dirty-flag array pointers from the stager's CridGridIndex.
     // tpcc.cpp wires these into TpccRecords so the executor can mark dirty
@@ -320,7 +327,7 @@ public:
     void prewarm_initial_undelivered_orderline(uint32_t num_warehouses);
 
 private:
-    uint8_t*  d_delivered_flag_ = nullptr;  // gpu_capacity_ bytes; 0=undelivered, 1=delivered
+    uint8_t*  d_reclaim_flag_ = nullptr;  // gpu_capacity_ bytes; 1 = logically dead, drain first
 
     // GPU-side stream compaction for the eviction-path miss-admit subset.
     // Replaces the previous "D2H all deficit items + CPU loop" with a single

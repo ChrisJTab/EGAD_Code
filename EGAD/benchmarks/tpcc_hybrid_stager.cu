@@ -29,6 +29,7 @@
 #include <cstring>
 #include <numa.h>
 #include "numa_affinity.h"
+#include "reclaim_flags.cuh"
 
 static void pin_current_thread_to_node1_cores()
 {
@@ -226,53 +227,9 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         if (i < n) grid2crid[grids[i]] = crids[i];
     }
 
-    // Delivered-first eviction (OL stager only): collect eviction
-    // candidates that are already flagged delivered. Doesn't follow FIFO
-    // order, so doesn't track or update the cursor's max_offset. Shares
-    // the out_count atomic with the original FIFO kernel: if this kernel
-    // partially fills the deficit, the original kernel called afterwards
-    // continues filling from where this left off.
-    __global__ void k_fifo_collect_evictions_delivered(uint32_t cap,
-                                            const uint32_t* __restrict__ resident_list,
-                                            const uint8_t* __restrict__ needed_flag,
-                                            const uint8_t* __restrict__ flush_pinned_flag,
-                                            const uint8_t* __restrict__ delivered_flag,
-                                            uint32_t deficit,
-                                            uint32_t* __restrict__ out_grids,
-                                            uint32_t* __restrict__ out_crids,
-                                            uint32_t* __restrict__ out_count)
-    {
-        uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-        uint32_t stride = blockDim.x * gridDim.x;
-        if (atomicAdd(out_count, 0u) >= deficit) return;
-        for (uint32_t g = tid; g < cap; g += stride) {
-            if (atomicAdd(out_count, 0u) >= deficit) break;
-            uint32_t crid = resident_list[g];
-            if (crid == 0xffffffffu) continue;       // empty
-            if (needed_flag[g] || flush_pinned_flag[g]) continue;
-            if (!delivered_flag[g]) continue;        // not delivered -> skip
-            uint32_t pos = atomicAdd(out_count, 1u);
-            if (pos < deficit) {
-                out_grids[pos] = g;
-                out_crids[pos] = crid;
-            }
-        }
-    }
-
-    // Clear the delivered flag for a list of GRIDs (used after eviction
-    // renames so the new occupants start as undelivered).
-    __global__ void k_clear_delivered_flag_by_grids(const uint32_t* __restrict__ grids,
-                                                   uint32_t n,
-                                                   uint32_t cap,
-                                                   uint8_t* __restrict__ delivered_flag)
-    {
-        uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= n) return;
-        uint32_t g = grids[i];
-        if (g != 0xffffffffu && g < cap) {
-            delivered_flag[g] = 0;
-        }
-    }
+    // The reclaim-first eviction kernels (flag-preferring collector,
+    // clear-on-rename, mark-by-CRIDs) live in reclaim_flags.cuh, shared
+    // with the YCSB stager.
 
     // Collect eviction candidates into out arrays
     __global__ void k_fifo_collect_evictions(uint32_t start,
@@ -420,25 +377,21 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                                TRec* GPU_records, TVer* GPU_versions,
                                TRec* CPU_records,
                                uint32_t gpu_capacity, uint32_t num_units,
-                               bool enable_delivery_aware_eviction)
+                               bool enable_reclaim_eviction)
         : alloc_(alloc),
           GPU_records_(GPU_records),
           GPU_versions_(GPU_versions),
           CPU_records_(CPU_records),
           gpu_capacity_(gpu_capacity),
           num_units_(num_units),
-          enable_delivery_aware_eviction_(enable_delivery_aware_eviction),
           crid2grid_index_(alloc_, gpu_capacity_, num_units_) // capacity=gpu slots, num_units=total CRIDs
     {
         auto &logger = Logger::GetInstance();
         // allocate device memory for the various arrays
         logger.Info("Initializing TpccHybridStager with GPU capacity: " + std::to_string(gpu_capacity_));
-        if (enable_delivery_aware_eviction_) {
-            logger.Info("  delivery-aware eviction ENABLED for this stager");
-            // Delivered-first eviction is unconditional on stagers
-            // constructed with the feature enabled (the OL stager).
-            delivery_aware_eviction_active_ = true;
-            logger.Info("    delivered-first eviction kernel: ACTIVE");
+        reclaim_eviction_active_ = enable_reclaim_eviction;
+        if (reclaim_eviction_active_) {
+            logger.Info("  reclaim-first eviction ENABLED for this stager");
         }
 
         // Each stager owns its own CUDA stream so cross-stager kernels do not
@@ -565,12 +518,12 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         d_scratch_f_ = static_cast<uint32_t*>(alloc_.Allocate(sizeof(uint32_t) * gpu_capacity_));
         d_filter_flags_ = static_cast<uint8_t*>(alloc_.Allocate(sizeof(uint8_t) * gpu_capacity_));
 
-        // Delivery-aware eviction (OL only): allocate the per-slot
-        // delivered flag, initialized to 0 (= undelivered). The Delivery
-        // executor sets it; the eviction pass prefers flagged slots.
-        if (enable_delivery_aware_eviction_) {
-            d_delivered_flag_ = static_cast<uint8_t*>(alloc_.Allocate(sizeof(uint8_t) * gpu_capacity_));
-            gpu_err_check(cudaMemset(d_delivered_flag_, 0, sizeof(uint8_t) * gpu_capacity_));
+        // Reclaim-first eviction: allocate the per-slot flag, initialized
+        // to 0 (= live). The Delivery executor and mark_reclaimable set
+        // it; the eviction pre-pass prefers flagged slots.
+        if (reclaim_eviction_active_) {
+            d_reclaim_flag_ = static_cast<uint8_t*>(alloc_.Allocate(sizeof(uint8_t) * gpu_capacity_));
+            gpu_err_check(cudaMemset(d_reclaim_flag_, 0, sizeof(uint8_t) * gpu_capacity_));
         }
 
         // Pre-allocate the CUB temp buffer used by the eviction-path stream
@@ -864,7 +817,7 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         sg_transfer_versions(h_crids.data(), h_grids.data(), n, /*epoch=*/0);
         sg_sync();
 
-        // 8. Pre-warmed slots start undelivered (delivered_flag = 0). The
+        // 8. Pre-warmed slots start live (reclaim_flag = 0). The
         //    buffer was zeroed in the constructor and we have not touched
         //    it here, so this is already correct -- no extra work needed.
 
@@ -1151,18 +1104,17 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                     GpuTimer tg("fifo:collect_evictions(gpu)");
                     constexpr int B = 256;
                     int G = 256;
-                    // When delivery-aware eviction is active (the OL
-                    // stager), do a first pass picking only delivered
-                    // slots. Shares
+                    // Reclaim-first pre-pass: drain flagged dead slots
+                    // (delivered OL rows, deleted NO rows) first. Shares
                     // d_cnt with the FIFO scan below: if this fills the
                     // deficit, the FIFO scan early-exits at its first
                     // atomic check. If it doesn't, the FIFO scan continues
                     // filling from where this left off.
-                    if (delivery_aware_eviction_active_) {
-                        k_fifo_collect_evictions_delivered<<<G, B, 0, s>>>(
+                    if (reclaim_eviction_active_) {
+                        k_collect_evictions_reclaim_first<<<G, B, 0, s>>>(
                             gpu_capacity_,
                             d_resident_list_, d_needed_grid_flag_,
-                            d_flush_pinned_flag_, d_delivered_flag_,
+                            d_flush_pinned_flag_, d_reclaim_flag_,
                             deficit,
                             d_evict_grids, d_evict_crids,
                             d_cnt);
@@ -1228,13 +1180,13 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                     int grid = (deficit + block - 1) / block;
                     k_set_grid2crid<<<grid, block, 0, s>>>(d_evict_grids, d_new_first, deficit, d_resident_list_);
                     gpu_err_check(cudaPeekAtLastError());
-                    // The renamed slots have new occupants whose
-                    // orders are not yet delivered. Clear their delivered
-                    // flag so the next eviction pass does not pick them
-                    // again before Delivery has had a chance to mark them.
-                    if (delivery_aware_eviction_active_) {
-                        k_clear_delivered_flag_by_grids<<<grid, block, 0, s>>>(
-                            d_evict_grids, deficit, gpu_capacity_, d_delivered_flag_);
+                    // The renamed slots have new occupants that are not
+                    // logically dead. Clear their reclaim flag so the next
+                    // eviction pass does not drain them before Delivery or
+                    // a delete has actually marked them.
+                    if (reclaim_eviction_active_) {
+                        k_clear_reclaim_by_grids<<<grid, block, 0, s>>>(
+                            d_evict_grids, deficit, gpu_capacity_, d_reclaim_flag_);
                         gpu_err_check(cudaPeekAtLastError());
                     }
         gpu_err_check(cudaStreamSynchronize(s));
@@ -1282,11 +1234,11 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                         k_set_grid2crid<<<grid, block, 0, s>>>(d_grids2, d_new_ + deficit, h_granted2, d_resident_list_);
                         gpu_err_check(cudaPeekAtLastError());
                         // Same reasoning as the prior rename site -- new
-                        // occupants are undelivered, so reset the flag for
-                        // these slots too.
-                        if (delivery_aware_eviction_active_) {
-                            k_clear_delivered_flag_by_grids<<<grid, block, 0, s>>>(
-                                d_grids2, h_granted2, gpu_capacity_, d_delivered_flag_);
+                        // occupants are live, so reset the flag for these
+                        // slots too.
+                        if (reclaim_eviction_active_) {
+                            k_clear_reclaim_by_grids<<<grid, block, 0, s>>>(
+                                d_grids2, h_granted2, gpu_capacity_, d_reclaim_flag_);
                             gpu_err_check(cudaPeekAtLastError());
                         }
         gpu_err_check(cudaStreamSynchronize(s));
@@ -1661,6 +1613,19 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                     }
                 }
         }
+    }
+
+    template <typename TRec, typename TVer>
+    void TpccHybridStager<TRec, TVer>::mark_reclaimable(const uint32_t* d_crids, uint32_t n)
+    {
+        if (!reclaim_eviction_active_ || n == 0 || d_crids == nullptr) return;
+        auto dv = crid2grid_index_.device_view();
+        constexpr int B = 256;
+        int G = (n + B - 1) / B;
+        k_mark_reclaim_by_crids<<<G, B, 0, prep_stream_>>>(d_crids, n,
+            dv.d_crid_to_grid, dv.num_units, gpu_capacity_, d_reclaim_flag_);
+        gpu_err_check(cudaPeekAtLastError());
+        gpu_err_check(cudaStreamSynchronize(prep_stream_));
     }
 
     template <typename TRec, typename TVer>
@@ -2079,8 +2044,8 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         free_cuda(reinterpret_cast<void*&>(d_ev_gr_miss_));
         free_alloc(reinterpret_cast<void*&>(d_ev_miss_count_));
 
-        // Delivery-aware eviction (OL stager only) per-slot delivered flag
-        free_alloc(reinterpret_cast<void*&>(d_delivered_flag_));
+        // Reclaim-first eviction per-slot flag
+        free_alloc(reinterpret_cast<void*&>(d_reclaim_flag_));
 
         free_alloc(reinterpret_cast<void*&>(d_clear_slots0_));
         free_alloc(reinterpret_cast<void*&>(d_clear_slots1_));

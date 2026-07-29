@@ -20,6 +20,7 @@
 
 #include <omp.h>
 
+#include <benchmarks/recovery_verify.h>     // FNV primitives for the liveness gate (validation build)
 #include <benchmarks/tpcc_flat_index.h>     // denseIdxOL
 #include <benchmarks/tpcc_table.h>          // key types
 #include <util_log.h>
@@ -96,6 +97,20 @@ TpccCpuShadowIndex::TpccCpuShadowIndex(TpccConfig config, uint32_t maxO_ol)
                     no_head, o_head, ol_head);
     }
 
+    // NewOrder delete-log allocations, only for Delivery-bearing mixes.
+    // Each NO row is delivered (deleted) at most once, so the durable
+    // log's bound is the NO key universe.
+    if (tpcc_config_.txn_mix.delivery > 0) {
+        h_no_delete_keys_ = static_cast<NewOrderKey::baseType*>(
+            Malloc(static_cast<size_t>(tpcc_config_.num_txns) * 10 * sizeof(NewOrderKey::baseType)));
+        if (durable) {
+            durable_no_delete_keys_ = static_cast<NewOrderKey::baseType*>(
+                MallocDurable("tpcc_shadow_no_del_keys",
+                              static_cast<size_t>(tpcc_config_.newOrderTableSize()) *
+                                  sizeof(NewOrderKey::baseType)));
+        }
+    }
+
     const size_t total_mb =
         (shadow_w_.size() + shadow_d_.size() + shadow_c_.size() + shadow_i_.size() + shadow_s_.size()
          + shadow_no_.size() + shadow_o_.size() + shadow_ol_.size()) * sizeof(uint32_t) / (1024ull * 1024ull);
@@ -111,6 +126,7 @@ TpccCpuShadowIndex::~TpccCpuShadowIndex()
     if (h_no_keys_) { Free(h_no_keys_); h_no_keys_ = nullptr; }
     if (h_o_keys_)  { Free(h_o_keys_);  h_o_keys_  = nullptr; }
     if (h_ol_keys_) { Free(h_ol_keys_); h_ol_keys_ = nullptr; }
+    if (h_no_delete_keys_) { Free(h_no_delete_keys_); h_no_delete_keys_ = nullptr; }
 }
 
 void TpccCpuShadowIndex::loadInitialData()
@@ -244,6 +260,125 @@ void TpccCpuShadowIndex::reconstructInsertsFromDurable(TpccFreeStarts f)
     Logger::GetInstance().Info("[RECOVER] reconstructed shadow inserts from durable arrays: NO={} O={} OL={}",
                                f.new_order, f.order, f.order_line);
 }
+
+void TpccCpuShadowIndex::mirrorEpochNoDeletes(uint32_t num_deletes, uint32_t old_delete_count)
+{
+    if (num_deletes == 0) return;
+
+    // Append this epoch's delivered NO keys to the durable delete log at
+    // [old_delete_count, old_delete_count+num_deletes). The recover
+    // process re-applies them via applyNoDeletesFromDurable up to the
+    // marker's delete cursor; the live path only appends here.
+    if (durable_no_delete_keys_) {
+        std::memcpy(durable_no_delete_keys_ + old_delete_count, h_no_delete_keys_,
+                    static_cast<size_t>(num_deletes) * sizeof(NewOrderKey::baseType));
+    }
+}
+
+// See header. Sentinel each deleted key's dense slot; the dual of
+// reconstructInsertsFromDurable's NO pass.
+void TpccCpuShadowIndex::applyNoDeletesFromDurable(uint32_t count)
+{
+    if (!durable_no_delete_keys_ || count == 0) return;
+
+    uint32_t first = 0;
+#ifdef EGAD_VALIDATION
+    // Negative control for the liveness gate: drop the first delete-log
+    // entry so its NO row is wrongly revived. verifyNoLiveAgainstLogs
+    // must catch the divergence; the store byte hashes cannot (a delete
+    // writes no record bytes). No-op unless the env hook is set.
+    if (std::getenv("EPIC_RECOVERY_DROP_ONE_DELETE") != nullptr) {
+        Logger::GetInstance().Info(
+            "[NEG-CONTROL] dropping NO delete-log entry 0 on recover");
+        first = 1;
+    }
+#endif // EGAD_VALIDATION
+
+    const uint32_t maxO_no = max_o_orders_;
+    for (uint32_t j = first; j < count; ++j) {
+        NewOrderKey k; k.base_key = durable_no_delete_keys_[j];
+        shadow_no_[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)] = kSentinel;
+    }
+    Logger::GetInstance().Info("[RECOVER] applied {} NO delete entries from durable shadow log", count);
+}
+
+#ifdef EGAD_VALIDATION
+
+namespace {
+// Per-entry fold for the NO liveness digest: FNV over (dense_idx, crid).
+// Combined across entries by sum, so the digest is order-independent and
+// comparable between a shadow walk and an independent log replay.
+inline uint64_t foldNoLiveEntry(uint32_t dense_idx, uint32_t crid)
+{
+    uint64_t h = fnv1aUpdate(kFnvOffsetBasis, &dense_idx, sizeof(dense_idx));
+    return fnv1aUpdate(h, &crid, sizeof(crid));
+}
+} // namespace
+
+// Straight-line replay of the NO logs into a scratch state: initial
+// undelivered population, then inserts [0, ins_count), then deletes
+// [0, del_count). Deliberately independent of loadInitialData /
+// reconstructInsertsFromDurable / applyNoDeletesFromDurable so it can
+// catch bugs in any of them.
+uint64_t TpccCpuShadowIndex::noLiveDigestFromLogs(uint32_t ins_count, uint32_t del_count) const
+{
+    if ((ins_count > 0 && !durable_no_keys_) || (del_count > 0 && !durable_no_delete_keys_)) return 0;
+
+    const uint32_t W = tpcc_config_.num_warehouses;
+    const uint32_t maxO_no = max_o_orders_;
+    std::vector<uint32_t> state(shadow_no_.size(), kSentinel);
+    for (uint32_t w = 1; w <= W; ++w) {
+        for (uint32_t d = 1; d <= 10; ++d) {
+            const uint32_t no_base = ((w - 1u) * 10u + (d - 1u)) * 900u;
+            for (uint32_t o = 2101; o <= 3000; ++o) {
+                state[denseIdxNO(w, d, o, maxO_no)] = no_base + (o - 2101u);
+            }
+        }
+    }
+    const uint32_t no_init = W * 10u * 900u;
+    for (uint32_t j = 0; j < ins_count; ++j) {
+        NewOrderKey k; k.base_key = durable_no_keys_[j];
+        state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)] = no_init + j;
+    }
+    for (uint32_t j = 0; j < del_count; ++j) {
+        NewOrderKey k; k.base_key = durable_no_delete_keys_[j];
+        state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)] = kSentinel;
+    }
+
+    uint64_t acc = 0;
+    #pragma omp parallel for reduction(+:acc) schedule(static)
+    for (size_t i = 0; i < state.size(); ++i) {
+        if (state[i] != kSentinel) acc += foldNoLiveEntry(static_cast<uint32_t>(i), state[i]);
+    }
+    return acc;
+}
+
+void TpccCpuShadowIndex::verifyNoLiveAgainstLogs(uint32_t ins_count, uint32_t del_count) const
+{
+    auto& logger = Logger::GetInstance();
+    uint64_t shadow_acc = 0;
+    size_t shadow_count = 0;
+    #pragma omp parallel for reduction(+:shadow_acc) reduction(+:shadow_count) schedule(static)
+    for (size_t i = 0; i < shadow_no_.size(); ++i) {
+        if (shadow_no_[i] != kSentinel) {
+            shadow_acc += foldNoLiveEntry(static_cast<uint32_t>(i), shadow_no_[i]);
+            ++shadow_count;
+        }
+    }
+    const uint64_t log_acc = noLiveDigestFromLogs(ins_count, del_count);
+    const size_t expected_count =
+        static_cast<size_t>(tpcc_config_.num_warehouses) * 10u * 900u + ins_count - del_count;
+    if (shadow_acc == log_acc && shadow_count == expected_count) {
+        logger.Info("[LIVE-CHECK] PASS NO shadow-vs-log at ins={} del={}: live={} digest=0x{:016x}",
+                    ins_count, del_count, shadow_count, shadow_acc);
+    } else {
+        logger.Error("[LIVE-CHECK] FAILED NO shadow-vs-log at ins={} del={}: "
+                     "shadow live={} digest=0x{:016x} vs log live={} digest=0x{:016x}",
+                     ins_count, del_count, shadow_count, shadow_acc, expected_count, log_acc);
+    }
+}
+
+#endif // EGAD_VALIDATION
 
 void TpccCpuShadowIndex::shiftSnapshotsAtEpochStart(uint32_t new_order_free_start,
                                                    uint32_t order_free_start,

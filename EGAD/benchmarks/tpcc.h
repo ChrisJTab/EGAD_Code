@@ -141,9 +141,13 @@ private:
     // back to end-of-(E-2) and replays E-1 and E. The 3 cursor pairs carry
     // f_{E-1}/f_{E-2} for the growing tables (p2 == f_{E-2} = the rollback target).
     // The banked publish (recovery_meta.h) keeps the epoch and the
-    // cursors coherent when a fault kills the process mid-update.
+    // cursors coherent when a fault kills the process mid-update. The
+    // NewOrder delete-log cursor pair is the insert pairs' dual
+    // (no_d_p2 = NO deletes durable at end-of-(E-2), the delete-side
+    // rollback target).
     struct TpccRecoveryCursors {
         uint32_t no_p1, no_p2, o_p1, o_p2, ol_p1, ol_p2;
+        uint32_t no_d_p1, no_d_p2;
     };
     using RecoveryMeta = BankedRecoveryMeta<TpccRecoveryCursors>;
     static_assert(offsetof(RecoveryMeta, publish) % 8 == 0,

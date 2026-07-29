@@ -133,11 +133,15 @@ void TpccDb::bumpRecoveryMarker(uint32_t crash_epoch)
 {
     if (!recovery_meta_) return;
     const TpccGrowingCounts gc = growingInsertCounts();
+    auto *gpu_index_ptr =
+        dynamic_cast<TpccGpuIndex<TpccTxnArrayT, TpccTxnParamArrayT>*>(index.get());
+    const uint32_t no_del = gpu_index_ptr ? gpu_index_ptr->getNoDeleteCount() : 0u;
     const uint64_t word = recovery_meta_->prepare(crash_epoch,
         [&](TpccRecoveryCursors& nb, const TpccRecoveryCursors* ob) {
             nb.no_p2 = ob ? ob->no_p1 : 0u; nb.no_p1 = static_cast<uint32_t>(gc.new_order);
             nb.o_p2  = ob ? ob->o_p1  : 0u; nb.o_p1  = static_cast<uint32_t>(gc.order);
             nb.ol_p2 = ob ? ob->ol_p1 : 0u; nb.ol_p1 = static_cast<uint32_t>(gc.order_line);
+            nb.no_d_p2 = ob ? ob->no_d_p1 : 0u; nb.no_d_p1 = no_del;
         });
 #ifdef EGAD_VALIDATION
     maybeTearMarkerAt(crash_epoch);

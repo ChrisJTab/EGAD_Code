@@ -121,6 +121,34 @@ public:
     // before rebuildIndexesFromShadow. No-op when not in durable mode.
     void reconstructInsertsFromDurable(TpccFreeStarts f);
 
+    // Per-epoch NewOrder delete mirror, the dual of mirrorEpoch's insert
+    // append. Appends this epoch's delivered NO keys (already D2H'd into
+    // h_no_delete_keys()) to the durable delete log at
+    // [old_delete_count, old_delete_count+n).
+    void mirrorEpochNoDeletes(uint32_t num_deletes, uint32_t old_delete_count);
+
+    // Recover-mode: apply the first `count` durable NO delete-log entries
+    // to the NewOrder shadow (sentinel each key's dense slot). Runs after
+    // reconstructInsertsFromDurable; deletes are terminal (a delivered
+    // (w,d,o) never recurs), so the two passes need no interleaving.
+    void applyNoDeletesFromDurable(uint32_t count);
+
+#ifdef EGAD_VALIDATION
+    // Order-independent digest of the live NewOrder key->CRID mapping
+    // derived from the durable logs alone (initial undelivered population
+    // + first ins_count insert entries minus first del_count delete
+    // entries). The delete-aware liveness gate: store byte hashes cannot
+    // see a wrongly revived NO row because a delete writes no record
+    // bytes. 0 when not in durable mode.
+    uint64_t noLiveDigestFromLogs(uint32_t ins_count, uint32_t del_count) const;
+
+    // Recover-time self-consistency check: the same digest computed over
+    // the reconstructed NO shadow must equal an independent straight-line
+    // replay of the logs at the rollback cursors. Logs [LIVE-CHECK] PASS
+    // or FAILED; does not throw.
+    void verifyNoLiveAgainstLogs(uint32_t ins_count, uint32_t del_count) const;
+#endif // EGAD_VALIDATION
+
     // Read-only access to the underlying vectors. Used by the GPU index
     // rebuild upload path.
     const std::vector<uint32_t>& shadow_w()  const { return shadow_w_;  }
@@ -143,6 +171,7 @@ public:
     NewOrderKey::baseType*  h_no_keys() { return h_no_keys_; }
     OrderKey::baseType*     h_o_keys()  { return h_o_keys_;  }
     OrderLineKey::baseType* h_ol_keys() { return h_ol_keys_; }
+    NewOrderKey::baseType*  h_no_delete_keys() { return h_no_delete_keys_; }
 
 private:
     TpccConfig tpcc_config_;
@@ -178,6 +207,16 @@ private:
     NewOrderKey::baseType*  durable_no_keys_ = nullptr;
     OrderKey::baseType*     durable_o_keys_  = nullptr;
     OrderLineKey::baseType* durable_ol_keys_ = nullptr;
+
+    // Pinned host buffer for per-epoch D2H of delivered (deleted) NO keys.
+    // Allocated only for Delivery-bearing mixes.
+    NewOrderKey::baseType*  h_no_delete_keys_ = nullptr;
+
+    // Durable append-only array of deleted NO keys, indexed by cumulative
+    // delete count; the insert log's dual. Each NO row is delivered at
+    // most once, so the log is bounded by the NO key universe. null when
+    // not in durable mode or the mix has no Delivery.
+    NewOrderKey::baseType*  durable_no_delete_keys_ = nullptr;
 };
 
 } // namespace epic::tpcc
