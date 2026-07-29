@@ -1064,7 +1064,8 @@ void TpccDb::runBenchmark()
         // no record bytes, so the store hashes above cannot distinguish a
         // live NO row from a delivered one; this line can. Durable runs
         // only (the logs are the source).
-        if (config.txn_mix.delivery > 0 && cpu_shadow_
+        if (config.execution_mode == ExecMode::HYBRID_STAGING
+            && config.txn_mix.delivery > 0 && cpu_shadow_
             && (std::getenv("EPIC_DURABLE_STORE") || std::getenv("EPIC_RECOVER_FROM"))) {
             if (auto* gi = dynamic_cast<TpccGpuIndex<TpccTxnArrayT, TpccTxnParamArrayT>*>(index.get())) {
                 logger.Info("[STATE-HASH-LIVE] tpcc NO live-mapping = 0x{:016x}",

@@ -960,8 +960,13 @@ public:
         logger.Trace("Allocating {} bytes for temp storage", formatSizeBytes(temp_storage_bytes));
         gpu_err_check(cudaMalloc(&d_temp_storage, temp_storage_bytes));
 
-        // NewOrder delete-set scratch, Delivery-bearing mixes only.
-        if (tpcc_config.txn_mix.delivery > 0) {
+        // NewOrder delete-set scratch, Delivery-bearing hybrid_staging
+        // runs only. The delete path is part of EGAD's staging design;
+        // the cpu_only / gpu_only baseline modes stay pure Epic (which
+        // performs no deletes), keeping their throughput floors and the
+        // upstream-parity claim untouched.
+        if (tpcc_config.execution_mode == ExecMode::HYBRID_STAGING
+            && tpcc_config.txn_mix.delivery > 0) {
             const size_t n_slots = static_cast<size_t>(tpcc_config.num_txns) * 10;
             gpu_err_check(cudaMalloc(&d_no_deletes, sizeof(NewOrderKey::baseType) * n_slots));
             gpu_err_check(cudaMalloc(&d_no_valid_deletes, sizeof(NewOrderKey::baseType) * n_slots));
@@ -1319,8 +1324,10 @@ public:
         // from the Delivery inputs and the CRIDs the kernel above
         // resolved, erases the keys from the NO map, and appends them to
         // the durable delete log. The compacted CRID list stays on device
-        // for the NO stager's reclaim-first marking.
-        if (tpcc_config.txn_mix.delivery > 0) {
+        // for the NO stager's reclaim-first marking. hybrid_staging only:
+        // the cpu_only / gpu_only baselines stay pure Epic.
+        if (tpcc_config.execution_mode == ExecMode::HYBRID_STAGING
+            && tpcc_config.txn_mix.delivery > 0) {
             const size_t n_slots = static_cast<size_t>(tpcc_config.num_txns) * 10;
             prepareTpccNoDeleteKernel<<<(tpcc_config.num_txns + block_size - 1) / block_size, block_size>>>(
                 GpuPackedTxnArray(txn_array), GpuTxnArrayType(index_array),

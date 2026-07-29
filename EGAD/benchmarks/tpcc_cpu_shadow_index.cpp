@@ -97,10 +97,12 @@ TpccCpuShadowIndex::TpccCpuShadowIndex(TpccConfig config, uint32_t maxO_ol)
                     no_head, o_head, ol_head);
     }
 
-    // NewOrder delete-log allocations, only for Delivery-bearing mixes.
-    // Each NO row is delivered (deleted) at most once, so the durable
-    // log's bound is the NO key universe.
-    if (tpcc_config_.txn_mix.delivery > 0) {
+    // NewOrder delete-log allocations, only for Delivery-bearing
+    // hybrid_staging runs (the delete path is hybrid-only; the baseline
+    // modes stay pure Epic). Each NO row is delivered (deleted) at most
+    // once, so the durable log's bound is the NO key universe.
+    if (tpcc_config_.execution_mode == ExecMode::HYBRID_STAGING
+        && tpcc_config_.txn_mix.delivery > 0) {
         h_no_delete_keys_ = static_cast<NewOrderKey::baseType*>(
             Malloc(static_cast<size_t>(tpcc_config_.num_txns) * 10 * sizeof(NewOrderKey::baseType)));
         if (durable) {
