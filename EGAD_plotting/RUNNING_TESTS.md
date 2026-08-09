@@ -66,6 +66,12 @@ cpu_only floor cell uses `build-off`. Tests 09 and 15 were already correct.
 After a fresh build, run 3-5 throwaway warmup reps before any figure cell; the
 first few runs on a new binary are ~5% slower.
 
+Test 16 (epoch-size sweep) additionally needs the TRUE-UPSTREAM 120 B
+checkout for its YCSB baseline arms: `./setup_epic_stock.sh --small-records`
+at the repo root, built per that script's printed instructions (or point
+`EGAD_STOCK_DIR` at an existing checkout). Without it the test runs the
+EGAD and TPC-C arms and skips the YCSB baselines with a notice.
+
 ---
 
 ## 2. Canonical invocations, per mode
