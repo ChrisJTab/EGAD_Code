@@ -1023,6 +1023,10 @@ whose cost grows with the checkpoint interval."
 | 64  | 8.84 | 7.31 | 6.18 | 17.3 % | 1.18x |
 | 128 | 8.53 | 6.99 | 6.08 | 18.0 % | 1.15x |
 
+- A re-measure on the final code (durable-mode submit ordering plus the
+  delete path active) widens the W>=8 band to 11.8-19.0 %; the paper
+  states 12-19 %. The committed figure and this table are the original
+  dataset.
 - Recovery overhead is 13-18 % across W>=8 (12.6 % at W=8 rising to
   ~17-18 % from W=32 up). The durable stores are tmpfs-backed and do
   not use huge pages, so the off arm's gains widen the percentage
