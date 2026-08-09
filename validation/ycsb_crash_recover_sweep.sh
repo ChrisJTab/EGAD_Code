@@ -14,17 +14,19 @@
 #
 # Usage:
 #   GPU=2 WL=ycsbf CES="10" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh
+#   GPU=2 WL=ycsbw CES="5" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh
 #   GPU=2 WL=ycsbi CES="2 5 7" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh
 #   GPU=2 WL=ycsbf CES="2 10 19" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh  # full
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BIN=${BIN:-EGAD/build/epic_driver}
 GPU=${GPU:-2}
-WL=${WL:-ycsbf}              # ycsbf (no inserts) | ycsbi (insert workload)
+WL=${WL:-ycsbf}              # ycsbf (no inserts) | ycsbi (inserts) | ycsbw (inserts + deletes)
 SEED=${SEED:-42}
 Z=${Z:-true}
 BASELINE=${BASELINE:-}
 BASEPOS=${BASEPOS:-}
+BASELIVE=${BASELIVE:-}
 CES=${CES:-"10"}
 CPS=${CPS:-"0"}
 DIR=${DIR:-/dev/shm/egad_ycsb_cr}
@@ -33,6 +35,10 @@ DIR=${DIR:-/dev/shm/egad_ycsb_cr}
 if [ "$WL" = "ycsbi" ]; then
     EPOCHS=${EPOCHS:-10}
     ARGS=(-b ycsbi -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
+          -n 8000000 -N 1000000 -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
+elif [ "$WL" = "ycsbw" ]; then
+    EPOCHS=${EPOCHS:-10}
+    ARGS=(-b ycsbw -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
           -n 8000000 -N 1000000 -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
 else
     EPOCHS=${EPOCHS:-20}
@@ -44,6 +50,7 @@ NUMA=(numactl --physcpubind=12-23,36-47 --membind=1)
 BASEENV=(EPIC_WORKLOAD_AWARE_AUTOSIZER=1
          OMP_DYNAMIC=false
          CUDA_VISIBLE_DEVICES=$GPU EPIC_YCSB_SEED=$SEED)
+live () { grep -aoE 'STATE-HASH-LIVE.*0x[0-9a-f]+' "$1" | grep -oE '0x[0-9a-f]+' | tail -1; }
 valonly () { grep -aoE 'STATE-HASH-VALONLY.*0x[0-9a-f]+' "$1" | grep -oE '0x[0-9a-f]+' | tail -1; }
 # positional [STATE-HASH] (byte-exact). Recovery reproduces it byte-
 # identically, so gating on it too catches value-swaps the value-multiset misses.
@@ -58,7 +65,8 @@ if [ -z "$BASELINE" ]; then
     env "${BASEENV[@]}" EPIC_DURABLE_STORE="$DIR" "${NUMA[@]}" "$BIN" "${ARGS[@]}" > "$blog" 2>&1
     BASELINE=$(valonly "$blog")
     BASEPOS=$(pos "$blog")
-    echo "[baseline] no-crash DURABLE $WL z=$Z seed=$SEED -> VALONLY=${BASELINE:-<none>} POS=${BASEPOS:-<none>}"
+    BASELIVE=$(live "$blog")
+    echo "[baseline] no-crash DURABLE $WL z=$Z seed=$SEED -> VALONLY=${BASELINE:-<none>} POS=${BASEPOS:-<none>} LIVE=${BASELIVE:-<none>}"
     # Also a non-durable run to confirm OFF byte-identical.
     nlog=/tmp/ycr_nodurable_${WL}_z${Z}_s${SEED}.log
     env "${BASEENV[@]}" "${NUMA[@]}" "$BIN" "${ARGS[@]}" > "$nlog" 2>&1
@@ -88,11 +96,15 @@ for ce in $CES; do for cp in $CPS; do
     rrc=$?
     rvo=$(valonly "$rlog"); rpos=$(pos "$rlog")
     vfail=$(grep -aE '\[VERIFY\].*FAILED' "$rlog")
+    lfail=$(grep -aE '\[LIVE-CHECK\] FAILED' "$rlog")
+    rlv=$(live "$rlog")
     demoted=$(grep -aoE 'demoted [0-9]+ slots' "$rlog" | grep -oE '[0-9]+' | head -1)
     ok=1; why=""
     { [ "$rvo" = "$BASELINE" ] && [ -n "$rvo" ]; } || { ok=0; why+=" VALONLY(${rvo:-none}!=$BASELINE)"; }
     if [ -n "$BASEPOS" ]; then { [ "$rpos" = "$BASEPOS" ] && [ -n "$rpos" ]; } || { ok=0; why+=" POS(${rpos:-none}!=$BASEPOS)"; }; fi
     [ -n "$vfail" ] && { ok=0; why+=" [VERIFY]FAILED"; }
+    [ -n "$lfail" ] && { ok=0; why+=" [LIVE-CHECK]FAILED"; }
+    if [ -n "$BASELIVE" ]; then { [ "$rlv" = "$BASELIVE" ]; } || { ok=0; why+=" LIVE(${rlv:-none}!=$BASELIVE)"; }; fi
     if [ "$ok" = 1 ]; then
         echo "  PASS  crash@e${ce} p${cp}  worker_rc=$wrc recover_rc=$rrc demoted=${demoted:-?}  VALONLY=$rvo POS=$rpos"
         pass=$((pass+1))
@@ -102,6 +114,27 @@ for ce in $CES; do for cp in $CPS; do
     fi
     rm -rf "$DIR"
 done; done
+# ycsbw only: drop-one-delete negative control. Re-run one crash cell but
+# recover with EPIC_RECOVERY_DROP_ONE_DELETE=1, which suppresses one delete
+# during shadow reconstruction. A wrongly revived key changes no record
+# bytes, so the byte gates alone cannot see it; the [LIVE-CHECK]
+# shadow-vs-log pass must catch it. SENSITIVE = it did.
+if [ "$WL" = "ycsbw" ]; then
+    nce=$(echo $CES | awk '{print $1}')
+    rm -rf "$DIR"; mkdir -p "$DIR"
+    nwlog=/tmp/ycr_negw_${WL}_e${nce}.log; nrlog=/tmp/ycr_negr_${WL}_e${nce}.log
+    env "${BASEENV[@]}" EPIC_DURABLE_STORE="$DIR" EPIC_CRASH_AT_EPOCH="$nce" EPIC_CRASH_AT_PHASE=3 \
+        "${NUMA[@]}" "$BIN" "${ARGS[@]}" > "$nwlog" 2>&1
+    env "${BASEENV[@]}" EPIC_RECOVER_FROM="$DIR" EPIC_RECOVERY_DROP_ONE_DELETE=1 \
+        "${NUMA[@]}" "$BIN" "${ARGS[@]}" > "$nrlog" 2>&1
+    rm -rf "$DIR"
+    if grep -aqE '\[LIVE-CHECK\] FAILED' "$nrlog"; then
+        echo "  NEG-CTRL drop-one-delete: LIVE-CHECK tripped (gate SENSITIVE)"
+    else
+        echo "  NEG-CTRL drop-one-delete: LIVE-CHECK did NOT trip (gate BLIND)"
+        fail=$((fail+1)); failed+=" negctrl-drop-one"
+    fi
+fi
 echo "----------------------------------------------------------------------"
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] && echo "ALL CRASH-RECOVER CELLS MATCH BASELINE (VALONLY)" || echo "FAILED:$failed"
