@@ -115,7 +115,7 @@ def render(by_skew: Dict[float, Dict[int, List[int]]]) -> None:
             rows.append([s, e, round(y, 4)])
 
     ax.axvspan(WINDOW[0], WINDOW[1], color="0.85", alpha=0.6, zorder=0)
-    ax.annotate("window", xy=(WINDOW[0] + 3, ax.get_ylim()[1] * 0.40),
+    ax.annotate("window", xy=(WINDOW[0] + 3, ax.get_ylim()[1] * 0.20),
                 fontsize=11, color="0.35", rotation=90, va="center")
     ax.set_xlabel("epoch", fontsize=13)
     ax.set_ylabel("admitted records (M)", fontsize=13)
