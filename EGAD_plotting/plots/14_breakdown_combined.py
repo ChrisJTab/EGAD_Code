@@ -75,8 +75,9 @@ YCSB_DIR = os.path.join(LOGS_DIR, "writeback_breakdown")
 TPCC_DIR = os.path.join(LOGS_DIR, "tpcc_writeback_breakdown")
 OUT_BASE = os.path.join(FIGURES_DIR, "breakdown_combined")
 
-# Steady-state windows (per feedback_steady_state_windows).
-YCSB_LO, YCSB_HI = 30, 40
+# Steady-state windows. YCSB matches the throughput headline's e250-280
+# (the 300-epoch protocol); TPC-C matches its own headline e30-50.
+YCSB_LO, YCSB_HI = 250, 280
 TPCC_LO, TPCC_HI = 30, 50
 
 PHASE_COLORS = {

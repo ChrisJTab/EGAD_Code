@@ -4,8 +4,10 @@
 # workloads. Single skew (theta=0.5), 120B records, 20M records, -rT-fF,
 # 33.6% cache cap (matched-ratio convention from plots 03/05/06/07).
 #
-# Each cell logs steady-state epochs e1-e40; the plotter averages across
-# e30-e40 for per-phase wallclock medians. The seven phase blocks rendered:
+# Each cell runs the full 300-epoch protocol of the throughput headline;
+# the plotter takes per-phase wallclock medians over the same steady-state
+# window e250-e280, so the breakdown cells and the headline cells share one
+# protocol. The seven phase blocks rendered:
 #   index_transfer, indexing, submission, staging, initialization, execution,
 #   writeback (= flush in sync; flush_sync_prev + flush_start_async in async)
 #
@@ -29,10 +31,7 @@ REPS=(1 2 3)
 # Match the cache pressure used in plots 05/06/07 (33.6% of 20M records).
 CACHE_CAP=6720000
 
-# 40 epochs gets us comfortably past warmup; e30-40 is the steady-state
-# window for per-phase median (different from the throughput-headline
-# e250-280 because we only need per-phase consistency, not a long average).
-EPOCHS=40
+EPOCHS=300
 
 run_one() {
     local bench=$1 mode=$2 rep=$3
