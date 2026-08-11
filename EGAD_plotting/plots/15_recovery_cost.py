@@ -121,25 +121,38 @@ def render(cells: Dict[Tuple[str, int], List[float]]) -> None:
     on = [med("on", w) for w in ws]
     cpu = [med("cpu", w) for w in ws]
 
+    def err(mode: str) -> list:
+        lo, hi = [], []
+        for w, center in zip(ws, [med(mode, w) for w in ws]):
+            vs = cells.get((mode, w), [])
+            lo.append(center - min(vs) if vs else 0.0)
+            hi.append(max(vs) - center if vs else 0.0)
+        return [lo, hi]
+
+    e_off, e_on, e_cpu = err("off"), err("on"), err("cpu")
+
     x = list(range(len(ws)))
     width = 0.38
     fig, ax = plt.subplots(figsize=(7.2, 3.4))
 
     b_off = ax.bar([xi - width / 2 for xi in x], off, width,
+                   yerr=e_off, capsize=2.5, error_kw=dict(elinewidth=1.0),
                    color=C_OFF, label="EGAD (no recovery)")
     b_on = ax.bar([xi + width / 2 for xi in x], on, width,
+                  yerr=e_on, capsize=2.5, error_kw=dict(elinewidth=1.0),
                   color=C_ON, label="EGAD (with recovery)")
 
     # cpu_only floor as a dashed step reference across the W groups.
     if all(c is not None for c in cpu):
-        ax.plot(x, cpu, color=C_CPU, linestyle="--", linewidth=1.4,
-                marker="x", markersize=6, label="EPIC-CPU")
+        ax.errorbar(x, cpu, yerr=e_cpu, capsize=2.5, elinewidth=1.0,
+                    color=C_CPU, linestyle="--", linewidth=1.4,
+                    marker="x", markersize=6, label="EPIC-CPU")
 
-    # Annotate recovery overhead % above each off/on pair.
+    # Annotate recovery overhead % above each off/on pair (above the whisker).
     for xi, (o, n) in enumerate(zip(off, on)):
         if o and n:
             pct = (o - n) / o * 100.0
-            top = max(o, n)
+            top = max(o + e_off[1][xi], n + e_on[1][xi])
             ax.annotate(f"$-{pct:.0f}\\%$", xy=(xi, top), xytext=(0, 4),
                         textcoords="offset points", ha="center", va="bottom",
                         fontsize=11, color=C_ON)
@@ -167,12 +180,18 @@ def render(cells: Dict[Tuple[str, int], List[float]]) -> None:
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["W", "off_mtxn_s", "on_mtxn_s", "cpu_mtxn_s",
-                    "recovery_overhead_pct", "on_x_cpu", "n_reps_on"])
+                    "recovery_overhead_pct", "on_x_cpu", "n_reps_on",
+                    "off_min", "off_max", "on_min", "on_max", "cpu_min", "cpu_max"])
         for i, wh in enumerate(ws):
             o, n, c = off[i], on[i], cpu[i]
             pct = (o - n) / o * 100.0 if (o and n) else ""
             ratio = n / c if (n and c) else ""
-            w.writerow([wh, o, n, c, pct, ratio, len(cells.get(("on", wh), []))])
+            rng = []
+            for mode, center in (("off", o), ("on", n), ("cpu", c)):
+                vs = cells.get((mode, wh), [])
+                rng += [round(min(vs), 3), round(max(vs), 3)] if vs else ["", ""]
+            w.writerow([wh, o, n, c, pct, ratio,
+                        len(cells.get(("on", wh), []))] + rng)
     print(f"saved {csv_path}")
 
 

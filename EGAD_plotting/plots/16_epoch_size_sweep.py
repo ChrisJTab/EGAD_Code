@@ -23,7 +23,7 @@ steady-state window (the LAST window_txns/S epochs; window_txns is
 hold total transactions fixed so the window sits at identical table
 state at every S). Epoch wallclock comes from the "Running epoch N"
 log-timestamp deltas, the tail epoch from the last timestamped line.
-Cells aggregate mean +/- std over reps.
+Cells aggregate the mean over reps, with whiskers spanning the reps.
 
 Reads $EGAD_LOGS_DIR/epoch_size_sweep/*.log; writes
 $EGAD_FIGURES_DIR/epoch_size_sweep.{pdf,png,csv}.
@@ -176,9 +176,9 @@ def render(cells) -> None:
                 continue
             ss = sorted(data)
             y = [statistics.mean(t for t, _ in data[s]) for s in ss]
-            ye = [statistics.stdev([t for t, _ in data[s]]) if len(data[s]) > 1 else 0.0
-                  for s in ss]
-            ax.errorbar(ss, y, yerr=ye, capsize=2.5, linewidth=1.6, markersize=7,
+            yerr = [[yy - min(t for t, _ in data[s]) for s, yy in zip(ss, y)],
+                    [max(t for t, _ in data[s]) - yy for s, yy in zip(ss, y)]]
+            ax.errorbar(ss, y, yerr=yerr, capsize=2.5, linewidth=1.6, markersize=7,
                         **SERIES_STYLE[series])
         ax.set_xscale("log")
         ax.set_xticks(tick_s)

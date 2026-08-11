@@ -142,7 +142,10 @@ def render(by_cell: Dict[Tuple[str, str], Dict[int, List[float]]]) -> None:
                 continue
             ws = sorted(cells.keys())
             ys = [statistics.median(cells[w]) for w in ws]
-            ax.plot(ws, ys, markersize=9, linewidth=1.6, **MODE_STYLE[mode])
+            yerr = [[y - min(cells[w]) for w, y in zip(ws, ys)],
+                    [max(cells[w]) - y for w, y in zip(ws, ys)]]
+            ax.errorbar(ws, ys, yerr=yerr, capsize=2.5, elinewidth=1.0,
+                        markersize=9, linewidth=1.6, **MODE_STYLE[mode])
         mix_ws = sorted({w for mode in MODE_ORDER for w in by_cell.get((mix, mode), {})})
         ticks = [w for w in mix_ws if mix != "tpcc" or w in NP_TICKS]
         ax.set_xscale("log", base=2)
@@ -173,13 +176,14 @@ def render(by_cell: Dict[Tuple[str, str], Dict[int, List[float]]]) -> None:
     csv_path = OUT_BASE + ".csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["mix", "mode", "warehouses", "median_mtxn_s", "n_reps"])
+        w.writerow(["mix", "mode", "warehouses", "median_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
         for mix in MIX_ORDER:
             for mode in MODE_ORDER:
                 cells = by_cell.get((mix, mode), {})
                 for ww in sorted(cells.keys()):
                     vs = cells[ww]
-                    w.writerow([mix, mode, ww, round(statistics.median(vs), 3), len(vs)])
+                    w.writerow([mix, mode, ww, round(statistics.median(vs), 3),
+                                round(min(vs), 3), round(max(vs), 3), len(vs)])
     print(f"saved {csv_path}")
 
 

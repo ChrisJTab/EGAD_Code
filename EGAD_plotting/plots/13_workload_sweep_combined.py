@@ -148,15 +148,17 @@ def render(top_cells, bot_cells) -> None:
 
     for ax, bench in zip(axes, WORKLOAD_ORDER):
         for cells, mode, color, ls, marker, label in series_specs:
-            ys: List[Optional[float]] = []
+            pts = []  # (skew, mean, min, max) -- center stays the mean
             for s in skews:
                 vs = cells.get((bench, mode, s), [])
-                ys.append(statistics.mean(vs) if vs else None)
-            xs_plot = [s for s, y in zip(skews, ys) if y is not None]
-            ys_plot = [y for y in ys if y is not None]
-            if ys_plot:
-                ax.plot(
-                    xs_plot, ys_plot,
+                if vs:
+                    pts.append((s, statistics.mean(vs), min(vs), max(vs)))
+            if pts:
+                xs_plot = [p[0] for p in pts]
+                ys_plot = [p[1] for p in pts]
+                yerr = [[p[1] - p[2] for p in pts], [p[3] - p[1] for p in pts]]
+                ax.errorbar(
+                    xs_plot, ys_plot, yerr=yerr, capsize=2.5, elinewidth=1.0,
                     color=color, linestyle=ls, marker=marker, markersize=7,
                     linewidth=1.6, label=label,
                 )
@@ -187,10 +189,11 @@ def render(top_cells, bot_cells) -> None:
     csv_path = OUT_BASE + ".csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["records", "bench", "mode", "skew", "median_mtxn_s", "n_reps"])
+        w.writerow(["records", "bench", "mode", "skew", "mean_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
         for label, cells in [("5M", top_cells), ("20M", bot_cells)]:
             for (bench, mode, skew), vs in sorted(cells.items()):
-                w.writerow([label, bench, mode, skew, round(statistics.mean(vs), 3), len(vs)])
+                w.writerow([label, bench, mode, skew, round(statistics.mean(vs), 3),
+                            round(min(vs), 3), round(max(vs), 3), len(vs)])
     print(f"saved {csv_path}")
 
 
