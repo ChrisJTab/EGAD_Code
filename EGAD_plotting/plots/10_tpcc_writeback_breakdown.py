@@ -63,7 +63,7 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 LOG_DIR = os.path.join(LOGS_DIR, "tpcc_writeback_breakdown")
 OUT_BASE = os.path.join(FIGURES_DIR, "tpcc_writeback_breakdown")
 
-# Steady-state window for TPCC (per feedback_steady_state_windows).
+# Steady-state window for TPCC (the headline e30-50 window).
 EPOCH_LO, EPOCH_HI = 30, 50
 
 PHASE_COLORS = {

@@ -59,7 +59,7 @@ LOG_DIR = os.path.join(LOGS_DIR, "recovery_cost")
 OUT_BASE = os.path.join(FIGURES_DIR, "recovery_cost")
 
 NTX_PER_EPOCH = 100_000
-WINDOW = (30, 50)  # TPC-C steady-state (feedback_steady_state_windows)
+WINDOW = (30, 50)  # TPC-C steady-state, the headline window
 
 C_OFF = "#1f4e79"  # non-recovery hybrid (blue)
 C_ON = "#b03a2e"   # recovery hybrid (red)
