@@ -1227,6 +1227,17 @@ settles to near-zero admissions by roughly epoch 100."
 - This is the direct answer to the window-looked-arbitrary concern; the
   companion prose sentence lives in the evaluation setup.
 
+### Cite
+- Steady-state admissions (mean over e250-280): 0.56 M/epoch at
+  theta=0.01, 0.52 at 0.2, 0.44 at 0.4, 0.31 at 0.6, 0.11 at 0.8,
+  0.00 at 0.99.
+- Design-section use: each steady admission into a full cache pairs
+  with an eviction, so the cache index absorbs up to ~1.1 M single-store
+  mutations per epoch against 1 M record operations (100 K txns x 10
+  ops), while the key-to-CRID hash table takes zero steady-state
+  mutations on insert-free workloads. This is the measured version of
+  the two-index argument.
+
 ### Caveats
 - YCSB-F only (the workload the setup discussion uses); other workloads
   share the admission mechanics.
