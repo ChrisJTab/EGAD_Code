@@ -1246,6 +1246,67 @@ settles to near-zero admissions by roughly epoch 100."
 
 ---
 
+## 18 - Measured epoch timeline (how async writeback rides under the epoch)
+
+`figures/epoch_timeline.{pdf,png,csv}` from `plots/18_epoch_timeline.py`
+(no new runs and no added instrumentation; reads the fig-08/14
+writeback_breakdown YCSB-F e300 logs -- every bar comes from log lines
+the driver already prints: per-phase `Epoch N <phase> time`, the
+`SG.transfer_versions.total` transfer span, and the worker's
+`worker_phases: half1/sg_wait/half2` line)
+
+### Headline claim
+"In async mode, epoch e's writeback runs on a worker lane while epoch
+e+1 occupies the main thread, split into two halves around a pause
+whose end coincides with the admission transfer's end (the cv-gated
+yield during the Primary Store gather). Inline in sync mode, the same
+writeback stretches the epoch from 10.29 to 12.49 ms."
+
+### Experimental design
+- Two panels, shared ms axis. (a) async: main-thread lane + writeback-
+  worker lane over two consecutive epochs; (b) sync: single lane, same
+  two-epoch span.
+- Drawn epochs: the median-duration epoch in the steady window
+  [250,280] of rep1 (a typical epoch, not a best case), for each mode
+  independently.
+- Panel-title per-epoch totals are computed with figure 14's exact
+  statistic (per-rep window mean of summed phases, mean across the
+  three reps), so figures 14 and 18 quote identical 10.29/12.49.
+- The staging block is split at the `transfer_versions` span into
+  "select + build" and "admission transfer (gather + H2D)".
+- Worker bars decompose per the worker_phases line: half1, pause
+  (sg_wait, grey), half2. Log granularity does not split D2H vs
+  scatter within a half (the shipped code does not time them apart).
+
+### How to read
+- Grey pause's right edge lands on the blue dotted line (the admission
+  transfer's end) in both drawn epochs; that is the gather-done signal
+  the worker blocks on.
+- The writeback of epoch e spills into epoch e+1 and ends before e+2,
+  the visible form of the 2-epoch durability bound.
+- Sync panel: writeback (red) sits inline after execution; fewer epochs
+  fit in the same span.
+
+### Cite
+- Per-epoch totals: async 10.29 ms, sync 12.49 ms (same values as
+  figure 14's ycsbf row).
+- Drawn async epoch e261: admission transfer 4.61 ms inside a 5.74 ms
+  staging block; worker pause ends with it.
+
+### Caveats
+- YCSB-F at theta=0.5 only, the moderate-writeback cell; TPC-C's
+  stager logs only worker totals (no halves), so a TPC-C panel is not
+  reconstructible from shipped logs.
+- Timeline positions come from log-line wall timestamps; sub-100 us
+  placement is approximate (logging latency), which is why the figure
+  draws ms-scale blocks and no finer.
+
+### Related
+- Plot 14 (the per-phase aggregates this figure shows one epoch of)
+- Plot 08 (same logs, YCSB sweep form)
+
+---
+
 # Appendices
 
 ## A. Why 120 B is the headline record size
