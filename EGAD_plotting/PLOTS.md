@@ -197,16 +197,17 @@ ycsbf, 120 B, -rF-fT, hybrid_staging async, e=300, e260 target.
 `figures/record_size.{pdf,png,csv}` from `plots/03_record_size.py`
 
 ### Headline claim
-"At matched cache pressure, 120 B records deliver 4.0 to 5.8 times higher
+"At matched cache pressure, 120 B records deliver 4.2 to 6.2 times higher
 hybrid throughput than 1 KB records below theta=0.99 (per-byte PCIe
-cost), and 1 KB hybrid sits below 1 KB cpu_only for theta<=0.4 (the
-staging bandwidth ceiling), crossing above at theta=0.6."
+cost), and 1 KB hybrid sits below 1 KB cpu_only for theta<=0.6 (the
+staging bandwidth ceiling), crossing above at theta=0.8."
 
 ### Experimental design
 - ycsbf, 120 B vs 1 KB, hybrid + cpu_only
 - cpu_only = unmodified upstream Epic (see CPU baseline provenance above);
-  1 KB cpu cells are medians of 10 reps (bimodal executor, see caveats),
-  120 B cpu cells are 3 reps like the hybrid cells
+  ALL cpu cells are medians of 10 reps as of 2026-08-12 (120 B cells
+  topped up from 3 on the quiet box; recurring slow mode, see caveats);
+  hybrid cells are 3-rep medians (tight)
 - 20 M records, 6 skews (0.01, 0.2, 0.4, 0.6, 0.8, 0.99)
 - 1 KB hybrid uses autosizer's natural ~10.54 M record cache (~52.7 %
   ratio)
@@ -219,18 +220,21 @@ staging bandwidth ceiling), crossing above at theta=0.6."
 - Solid blue (120 B hybrid) is the headline curve, above its baseline
   from theta=0.2 up.
 - Solid red (1 KB hybrid) sits BELOW dashed red (1 KB cpu_only) through
-  theta=0.4 - the "staging bandwidth ceiling" region - and pulls above
-  from theta=0.6.
+  theta=0.6 - the "staging bandwidth ceiling" region - and pulls above
+  from theta=0.8.
 
 ### Cite
-- 120 B: hybrid wins from theta=0.2 up (1.24x to 2.12x; peak 2.12x at
-  theta=0.8, 14.53 vs 6.87 MTxn/s). theta=0.01 is parity (0.97x, 8.73 vs
-  9.02). theta=0.99 is 1.28x (4.98 vs 3.90; both sides contention-bound).
-- 1 KB: hybrid below cpu_only at theta<=0.4 (0.69x at theta=0.01, 1.57 vs
-  2.29), 1.04x at theta=0.6, then 1.66x at theta=0.8 and 1.76x at
-  theta=0.99 (3.54 vs 2.01).
-- 120 B / 1 KB hybrid ratio: 4.0x to 5.8x below theta=0.99; 1.4x at
+- 120 B: hybrid wins from theta=0.2 up (1.14x to 1.98x; peak 1.98x at
+  theta=0.8, 15.13 vs 7.63 MTxn/s). theta=0.01 is just below (0.95x,
+  8.69 vs 9.13). theta=0.99 is 1.28x (5.00 vs 3.91; contention-bound).
+- 1 KB: hybrid below cpu_only at theta<=0.6 (0.61x at theta=0.01, 1.54 vs
+  2.53; 0.94x at theta=0.6), then 1.28x at theta=0.8 and 1.33x at
+  theta=0.99 (3.80 vs 2.86).
+- 120 B / 1 KB hybrid ratio: 4.2x to 6.2x below theta=0.99; 1.3x at
   theta=0.99 where GPU-executor contention bounds both record sizes.
+- (Medians of ten resist the cpu slow mode; the old 3-rep means sat
+  between modes, which is why several ratios moved with the 2026-08-12
+  top-up: peak 2.12x->1.98x, 1 KB high-skew 1.76x->1.33x.)
 
 ### Caveats
 - This is an apples-to-apples per-byte cost comparison, NOT a

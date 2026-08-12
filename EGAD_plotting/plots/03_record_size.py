@@ -134,11 +134,13 @@ def render(cells: Dict[Tuple[str, str, float], List[float]]) -> None:
     ]
 
     for size, mode, color, ls, marker, label in series_cfg:
-        pts = []  # (skew, mean, min, max) -- center stays the mean
+        # Median center: the EPIC-CPU cells carry mode structure across their
+        # ten reps (upstream's slow mode), and a mean would sit between modes.
+        pts = []  # (skew, median, min, max)
         for s in skews:
             vs = cells.get((size, mode, s), [])
             if vs:
-                pts.append((s, statistics.mean(vs), min(vs), max(vs)))
+                pts.append((s, statistics.median(vs), min(vs), max(vs)))
         if not pts:
             continue
         xs_plot = [p[0] for p in pts]
@@ -165,9 +167,9 @@ def render(cells: Dict[Tuple[str, str, float], List[float]]) -> None:
     csv_path = OUT_BASE + ".csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["size", "mode", "skew", "mean_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
+        w.writerow(["size", "mode", "skew", "median_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
         for (size, mode, skew), vs in sorted(cells.items()):
-            w.writerow([size, mode, skew, statistics.mean(vs),
+            w.writerow([size, mode, skew, statistics.median(vs),
                         round(min(vs), 3), round(max(vs), 3), len(vs)])
     print(f"saved {csv_path}")
 
