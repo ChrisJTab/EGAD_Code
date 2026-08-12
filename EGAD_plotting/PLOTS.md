@@ -10,12 +10,15 @@ spanning its repetitions (min to max), rendered from the same committed
 log datasets. Center statistics were verified cell-exact against the
 prior CSVs before the swap, so every cite table below still holds. The
 CSVs gained min/max columns, and the rep-aggregation columns of figures
-03/06/07/13 were renamed `mean_mtxn_s` to say what they always computed
-(fig 09/15 genuinely use medians and keep `median_mtxn_s`). Known
-mode-structure cells whose whiskers are now visibly wide: the 1 KB
-EPIC-CPU cells of fig 03 (documented bimodal, ten reps) and the rTfF
-EPIC-CPU theta=0.8 cell of fig 06 (reps 1.66/5.7/5.89; candidates for a
-ten-rep top-up and a median center, pending a decision).
+07/13 were renamed `mean_mtxn_s` to say what they always computed
+(fig 09/15 genuinely use medians and keep `median_mtxn_s`). Figures 03
+and 06 switched to median centers (`median_mtxn_s`) on 2026-08-12:
+upstream's CPU executor shows a recurring slow mode on this hardware,
+and the affected cells (every fig-03 cpu cell; fig 06 rTfF theta=0.8
+and rFfT theta=0.6/0.8) carry ten reps, topped up on a quiet box, so
+the median sits on the dominant mode instead of between modes.
+Headline movements from that switch are disclosed in each figure's
+section below.
 
 ---
 
@@ -367,8 +370,8 @@ theta=0.99)."
 ### Headline claim
 "The hybrid design's win over cpu_only depends on read/write semantics.
 At -rT-fT (full-record reads against field-split storage), the 10x
-read-op amplification eats throughput and hybrid loses to cpu_only below
-theta=0.6."
+read-op amplification eats throughput and hybrid loses to cpu_only at
+every skew except a tie at theta=0.8."
 
 ### Experimental design
 - ycsbf, 120 B, 20 M records
@@ -380,6 +383,13 @@ theta=0.6."
   CPU mode refuses field-split configs outright ("split field not
   supported on CPU", verified 2026-07-17). The 25dac65 rewrite added
   that capability; the paper discloses it where the figure is discussed.
+- Centers are per-cell medians (2026-08-12). The slow-mode cpu cells
+  (rTfF theta=0.8: reps down to 1.66; rFfT theta=0.6/0.8: reps down to
+  5.25/3.08) carry ten reps each; all other cells are 3-rep medians
+  (tight). Movements vs the old 3-rep means: rTfF theta=0.8 ratio
+  2.52x -> 1.53x (the old cpu mean sat in the slow mode), rTfF
+  theta=0.99 1.19x -> 1.28x, low-skew band 0.91-0.97x -> 0.90-0.93x,
+  rFfT theta=0.8 2.08x -> 1.85x.
 - Cache pressure held at ~33.6 % across configs:
   - -rT-fF: `EPIC_YCSB_CACHE_CAP=6720000` (records, 33.6 % of 20 M)
   - -rT-fT and -rF-fT: no cap (autosizer's natural pick = 67 M field-units,
@@ -388,18 +398,18 @@ theta=0.6."
 
 ### How to read
 - 6 lines, 3 colors x {hybrid solid, cpu_only dashed}:
-  - Blue (-rT-fF): regime split, hybrid 0.91x to 0.97x at theta <= 0.4,
-    then 1.21x at 0.6, 2.52x at 0.8, 1.19x at 0.99
+  - Blue (-rT-fF): regime split, hybrid 0.90x to 0.93x at theta <= 0.4,
+    then 1.21x at 0.6, 1.53x at 0.8, 1.28x at 0.99
   - Red (-rT-fT): hybrid LOSES to cpu_only at every skew except a
-    1.02x tie at theta=0.8 (0.62 to 0.82x elsewhere). This is the
+    1.01x tie at theta=0.8 (0.55 to 0.81x elsewhere). This is the
     "falls short" line.
   - Green (-rF-fT): hybrid at or above parity everywhere, biggest at
-    theta=0.8 (2.08x) and theta=0.99 (1.88x)
+    theta=0.99 (1.88x) and theta=0.8 (1.85x)
 
 ### Cite
 - At -rT-fT, hybrid throughput is 1.9 to 3.5 MTxn/s vs cpu_only 3.0 to
-  3.5 MTxn/s - at or below baseline across the sweep.
-- At -rT-fF, hybrid 7.7 to 11.1 MTxn/s vs stock cpu_only 4.2 to 9.0.
+  3.8 MTxn/s - at or below baseline across the sweep.
+- At -rT-fF, hybrid 5.0 to 11.5 MTxn/s vs stock cpu_only 3.9 to 9.0.
 - At -rF-fT, hybrid up to 17.3 MTxn/s at theta=0.99, the absolute peak
   (1.88x its cpu baseline there).
 

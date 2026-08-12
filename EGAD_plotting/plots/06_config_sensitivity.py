@@ -139,11 +139,14 @@ def render(cells: Dict[Tuple[str, str, float], List[float]]) -> None:
             ("hybrid_staging", "-",  "o"),
             ("cpu_only",       "--", "x"),
         ):
-            pts = []  # (skew, mean, min, max) -- center stays the mean
+            # Median center: the EPIC-CPU cells carry mode structure across
+            # their reps (upstream's slow mode), and a mean would sit between
+            # modes. Cells whose whiskers showed both modes carry ten reps.
+            pts = []  # (skew, median, min, max)
             for s in skews:
                 vs = cells.get((config, mode, s), [])
                 if vs:
-                    pts.append((s, statistics.mean(vs), min(vs), max(vs)))
+                    pts.append((s, statistics.median(vs), min(vs), max(vs)))
             if not pts:
                 continue
             xs_plot = [p[0] for p in pts]
@@ -190,9 +193,9 @@ def render(cells: Dict[Tuple[str, str, float], List[float]]) -> None:
     csv_path = OUT_BASE + ".csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["config", "mode", "skew", "mean_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
+        w.writerow(["config", "mode", "skew", "median_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
         for (config, mode, skew), vs in sorted(cells.items()):
-            w.writerow([config, mode, skew, statistics.mean(vs),
+            w.writerow([config, mode, skew, statistics.median(vs),
                         round(min(vs), 3), round(max(vs), 3), len(vs)])
     print(f"saved {csv_path}")
 
