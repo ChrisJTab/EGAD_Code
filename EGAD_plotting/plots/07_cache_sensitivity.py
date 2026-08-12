@@ -134,15 +134,22 @@ def render(
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
 
     ys = [statistics.mean(hybrid_by_pct[p]) for p in pcts]
-    ax.plot(pcts, ys, color=C_HYBRID, linestyle="-", marker="o",
-            markersize=9, linewidth=1.6, label="EGAD")
+    yerr = [[y - min(hybrid_by_pct[p]) for p, y in zip(pcts, ys)],
+            [max(hybrid_by_pct[p]) - y for p, y in zip(pcts, ys)]]
+    ax.errorbar(pcts, ys, yerr=yerr, capsize=2.5, elinewidth=1.0,
+                color=C_HYBRID, linestyle="-", marker="o",
+                markersize=9, linewidth=1.6, label="EGAD")
 
     if "gpu_only" in baseline_by_mode and baseline_by_mode["gpu_only"]:
-        y_gpu = statistics.mean(baseline_by_mode["gpu_only"])
+        vs = baseline_by_mode["gpu_only"]
+        y_gpu = statistics.mean(vs)
+        ax.axhspan(min(vs), max(vs), color=C_GPU, alpha=0.12, linewidth=0)
         ax.axhline(y_gpu, color=C_GPU, linestyle="--", linewidth=1.2,
                    label=f"EPIC-GPU ({y_gpu:.1f})")
     if "cpu_only" in baseline_by_mode and baseline_by_mode["cpu_only"]:
-        y_cpu = statistics.mean(baseline_by_mode["cpu_only"])
+        vs = baseline_by_mode["cpu_only"]
+        y_cpu = statistics.mean(vs)
+        ax.axhspan(min(vs), max(vs), color=C_CPU, alpha=0.12, linewidth=0)
         ax.axhline(y_cpu, color=C_CPU, linestyle="--", linewidth=1.2,
                    label=f"EPIC-CPU ({y_cpu:.1f})")
 
@@ -162,14 +169,16 @@ def render(
     csv_path = OUT_BASE + ".csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["mode", "cache_pct", "median_mtxn_s", "n_reps"])
+        w.writerow(["mode", "cache_pct", "mean_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
         for p in pcts:
             vs = hybrid_by_pct[p]
-            w.writerow(["hybrid_staging", p, statistics.mean(vs), len(vs)])
+            w.writerow(["hybrid_staging", p, statistics.mean(vs),
+                        round(min(vs), 3), round(max(vs), 3), len(vs)])
         for mode in ("gpu_only", "cpu_only"):
             vs = baseline_by_mode.get(mode, [])
             if vs:
-                w.writerow([mode, "", statistics.mean(vs), len(vs)])
+                w.writerow([mode, "", statistics.mean(vs),
+                            round(min(vs), 3), round(max(vs), 3), len(vs)])
     print(f"saved {csv_path}")
 
 

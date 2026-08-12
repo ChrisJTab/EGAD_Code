@@ -134,16 +134,18 @@ def render(cells: Dict[Tuple[str, str, float], List[float]]) -> None:
     ]
 
     for size, mode, color, ls, marker, label in series_cfg:
-        ys: List[Optional[float]] = []
+        pts = []  # (skew, mean, min, max) -- center stays the mean
         for s in skews:
             vs = cells.get((size, mode, s), [])
-            ys.append(statistics.mean(vs) if vs else None)
-        xs_plot = [s for s, y in zip(skews, ys) if y is not None]
-        ys_plot = [y for y in ys if y is not None]
-        if not ys_plot:
+            if vs:
+                pts.append((s, statistics.mean(vs), min(vs), max(vs)))
+        if not pts:
             continue
-        ax.plot(
-            xs_plot, ys_plot,
+        xs_plot = [p[0] for p in pts]
+        ys_plot = [p[1] for p in pts]
+        yerr = [[p[1] - p[2] for p in pts], [p[3] - p[1] for p in pts]]
+        ax.errorbar(
+            xs_plot, ys_plot, yerr=yerr, capsize=2.5, elinewidth=1.0,
             color=color, linestyle=ls, marker=marker, markersize=8,
             linewidth=1.6, label=label,
         )
@@ -163,9 +165,10 @@ def render(cells: Dict[Tuple[str, str, float], List[float]]) -> None:
     csv_path = OUT_BASE + ".csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["size", "mode", "skew", "median_mtxn_s", "n_reps"])
+        w.writerow(["size", "mode", "skew", "mean_mtxn_s", "min_mtxn_s", "max_mtxn_s", "n_reps"])
         for (size, mode, skew), vs in sorted(cells.items()):
-            w.writerow([size, mode, skew, statistics.mean(vs), len(vs)])
+            w.writerow([size, mode, skew, statistics.mean(vs),
+                        round(min(vs), 3), round(max(vs), 3), len(vs)])
     print(f"saved {csv_path}")
 
 

@@ -6,7 +6,7 @@
 #   on  = recovery: off + EPIC_DURABLE_STORE (durable Primary Store, always
 #         provisioned on create -- the ship config; lazy commit is not viable)
 #   cpu = stock EPIC cpu_only floor (no env, no NUMA pin, -c 24, OFF binary)
-# tpccdeck mix, e=50, steady-state window e30-50 (per feedback_steady_state_windows).
+# tpccdeck mix, e=50, steady-state window e30-50 (the TPC-C headline window).
 # 6 W x 3 modes x 3 reps = 54 runs. drop_caches before each; durable store in
 # /dev/shm (cleaned before+after every recovery run; ~34 GB at W=128 < 63 GB).
 # Per-cell skip if log exists unless FORCE_RERUN=1.

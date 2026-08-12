@@ -5,6 +5,18 @@ claim, the experimental design, what to point at when reading it, the
 numbers worth citing, and what NOT to claim. Plot scripts in `plots/` have
 the technical mechanism; this file has the paper-framing context.
 
+Variance display (2026-08-11): every measured figure draws whiskers
+spanning its repetitions (min to max), rendered from the same committed
+log datasets. Center statistics were verified cell-exact against the
+prior CSVs before the swap, so every cite table below still holds. The
+CSVs gained min/max columns, and the rep-aggregation columns of figures
+03/06/07/13 were renamed `mean_mtxn_s` to say what they always computed
+(fig 09/15 genuinely use medians and keep `median_mtxn_s`). Known
+mode-structure cells whose whiskers are now visibly wide: the 1 KB
+EPIC-CPU cells of fig 03 (documented bimodal, ten reps) and the rTfF
+EPIC-CPU theta=0.8 cell of fig 06 (reps 1.66/5.7/5.89; candidates for a
+ten-rep top-up and a median center, pending a decision).
+
 ---
 
 ## Hardware
@@ -1177,6 +1189,35 @@ TPC-C deck (W=64, MTxn/s):
   belongs to)
 - Plot 09 (TPC-C baseline conventions and the W-axis sweep at fixed
   S=100K)
+
+---
+
+## 17 - Per-epoch admission volume across the run (window justification)
+
+`figures/ycsb_admit_warmup.{pdf,png,csv}` from `plots/17_ycsb_admit_warmup.py`
+(no new runs; reads the fig-05/13 beyond\_hbm 120 B hybrid logs)
+
+### Headline claim
+"The [250,280] measurement window samples a settled regime. Per-epoch
+admission volume falls as the hot set accumulates and flattens within
+the first tens of epochs at every skew; the slowest decay, theta=0.99,
+settles to near-zero admissions by roughly epoch 100."
+
+### How to read
+- One line per skew (viridis, dark = low skew), mean across the three
+  headline reps; the shaded band is the reporting window.
+- Plateau ordering is the expected one: lower skew touches more
+  distinct records per epoch, so its steady admission volume is higher
+  (theta=0.01 ~0.56 M/epoch; theta=0.99 ~0, the hot set is fully
+  cached).
+- This is the direct answer to the window-looked-arbitrary concern; the
+  companion prose sentence lives in the evaluation setup.
+
+### Caveats
+- YCSB-F only (the workload the setup discussion uses); other workloads
+  share the admission mechanics.
+- Warmup epochs are visible by design; nothing before the window is
+  reported anywhere else in the paper.
 
 ---
 
