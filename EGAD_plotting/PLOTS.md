@@ -924,7 +924,7 @@ async and sync are indistinguishable on it (0.98x)."
   aggregated into a single `stage` block to match TPC-C's
   `prepareEpoch` granularity. Both share the same 7-phase axis:
   `index_transfer | indexing | submission | stage | initialization | execution | writeback`.
-- Steady-state windows: YCSB e30-e40, TPCC e30-e50 (matches plots
+- Steady-state windows: YCSB e250-e280 (the 300-epoch headline protocol), TPCC e30-e50 (matches plots
   08 and 10 respectively).
 
 ### How to read
@@ -944,13 +944,13 @@ Two secondary observations the figure makes visible:
   Appendix C; without an active writeback worker the inflation does
   not happen, which confirms the worker thread is the cause.
 
-### Cite (measured 2026-07-06; TPC-C cells epic@996e4a5, YCSB cells epic@34d2939; 3 reps each, all medians)
+### Cite (TPC-C cells 2026-07-06 epic@996e4a5, e30-50 rep medians; YCSB cells re-measured 2026-08-12, engine 54ca62c, 300-epoch protocol, e250-280 window, rep means; 3 reps each)
 
 | Workload | sync ms | async ms | speedup | wb sync ms | wb async ms |
 |---|---|---|---|---|---|
 | TPC-C tpccdeck W=128 | 25.65 | **11.24** | **2.28x** | 17.06 (67%) | 1.80 |
-| YCSB-F theta=0.5     | 12.50 | 10.30     | 1.21x    | 4.28        | 0.83        |
-| YCSB-B theta=0.5     |  8.37 |  8.51     | 0.98x    | 0.65        | 0.31        |
+| YCSB-F theta=0.5     | 12.49 | 10.29     | 1.21x    | 4.26        | 0.79        |
+| YCSB-B theta=0.5     |  8.49 |  8.88     | 0.96x    | 0.64        | 0.41        |
 
 - TPC-C tpccdeck is the **optimal async case** on our workload
   set. The writeback (17.06 ms) exceeds all other phases combined
