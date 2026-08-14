@@ -16,6 +16,8 @@ deterministic batched execution it extends beyond device memory, and the
 included harness reproduces the paper's YCSB and TPC-C evaluation on
 databases that exceed device memory.
 
+The paper describing EGAD is included as [EGAD_paper.pdf](EGAD_paper.pdf).
+
 ## Repository layout
 
 | Path | Contents |
