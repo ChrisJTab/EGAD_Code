@@ -472,6 +472,15 @@ is faster."
 
 ## 08 - Async vs sync writeback (per-phase breakdown)
 
+### Note (2026-09-10)
+The hybrid points predate the removal of the eviction-side writeback pin
+(commit "stager: remove the writeback pin"). A three-repetition A/B of the
+two builds on this figure's cells found them equal within run-to-run noise
+at 10 % cache and above; at 5 % cache the current build measures about 12 %
+higher (6.1-6.5 MTxn/s against the 5.44 plotted), because the old build's
+per-epoch eviction fallback fired at that ratio. The plotted data was kept
+as one coherent campaign; the difference does not affect any stated claim.
+
 `figures/writeback_breakdown.{pdf,png,csv}` from `plots/08_writeback_breakdown.py`
 
 ### Headline claim
