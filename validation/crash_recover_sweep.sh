@@ -71,11 +71,18 @@ for ce in $CES; do for cp in $CPS; do
     rrc=$?
     rvm=$(valms "$rlog"); rpos=$(pos "$rlog")
     vfail=$(grep -aE '\[VERIFY\].*FAILED' "$rlog")
+    # Liveness gates of the delete path (validation build, recover run):
+    # the reconstructed NewOrder shadow must equal an independent log replay,
+    # and the rebuilt GPU NewOrder index must agree with the logs' live set.
+    lfail=$(grep -aE '\[LIVE-CHECK\] FAILED|\[MAP-CHECK\] FAILED' "$rlog")
+    mpass=$(grep -aE '\[MAP-CHECK\] PASS' "$rlog")
     demoted=$(grep -aoE 'demoted [0-9]+ slots' "$rlog" | grep -oE '[0-9]+' | head -1)
     ok=1; why=""
     { [ "$rvm" = "$BASELINE" ] && [ -n "$rvm" ]; } || { ok=0; why+=" VALMS(${rvm:-none}!=$BASELINE)"; }
     if [ -n "$BASEPOS" ]; then { [ "$rpos" = "$BASEPOS" ] && [ -n "$rpos" ]; } || { ok=0; why+=" POS(${rpos:-none}!=$BASEPOS)"; }; fi
     [ -n "$vfail" ] && { ok=0; why+=" [VERIFY]FAILED"; }
+    [ -n "$lfail" ] && { ok=0; why+=" [LIVE-CHECK/MAP-CHECK]FAILED"; }
+    [ -z "$mpass" ] && { ok=0; why+=" [MAP-CHECK]missing"; }
     if [ "$ok" = 1 ]; then
         echo "  PASS  crash@e${ce} p${cp}  worker_rc=$wrc recover_rc=$rrc demoted=${demoted:-?}  VALMS=$rvm POS=$rpos"
         pass=$((pass+1))

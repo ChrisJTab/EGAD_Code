@@ -159,6 +159,13 @@ __global__ void gpuPiecewiseExecKernel(YcsbConfig config, void *records, void *v
 
     uint32_t data = 0;
 
+    // An op with no record (absent at its serial position) was not planned;
+    // nothing to execute.
+    if (txn->record_ids[warp_piece_id] == 0xffffffffu)
+    {
+        return;
+    }
+
     switch (txn->ops[warp_piece_id])
     {
     case YcsbOpType::READ: {
@@ -279,6 +286,13 @@ __global__ void gpuNoSplitPiecewiseExecKernel(YcsbConfig config, void *records, 
 
     uint32_t data = 0;
 
+    // An op with no record (absent at its serial position) was not planned;
+    // nothing to execute.
+    if (txn->record_ids[warp_piece_id] == 0xffffffffu)
+    {
+        return;
+    }
+
     switch (txn->ops[warp_piece_id])
     {
     case YcsbOpType::READ: {
@@ -368,6 +382,11 @@ __global__ void gpuNoSplitThreadPiecewiseExecKernel(YcsbConfig config, void *rec
     YcsbVersions *versions_ptr = reinterpret_cast<YcsbVersions *>(versions);
 
     uint32_t data = 0;
+
+    if (txn->record_ids[thread_piece_id] == 0xffffffffu)
+    {
+        return;
+    }
 
     switch (txn->ops[thread_piece_id])
     {

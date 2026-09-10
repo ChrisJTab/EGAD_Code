@@ -112,11 +112,24 @@ int main(int argc, char **argv)
                 // at the head of the key space and deletes the same number of
                 // keys from the tail, so the live set stays at its starting
                 // size while the key space slides. Reads and updates draw
-                // from the live window only, which keeps every delete
-                // terminal (no operation ever touches a key after its
-                // delete). Requires hybrid_staging with split_field=false.
+                // from the live window only, so a key is never touched after
+                // its delete (a property of this workload; the index resolves
+                // any order, see ycsbx). Requires hybrid_staging with
+                // split_field=false.
                 bench = "ycsb";
                 ycsb_config.txn_mix = {60, 20, 0, 10, 10};
+            }
+            else if (bench == "ycsbx")
+            {
+                // Validation mix for the delete semantics: the ycsbw churn plus
+                // planted transactions that read after a delete, delete and
+                // re-insert a key inside one epoch and across epochs, insert
+                // a live key, read a key before its insert, and delete a key
+                // twice. Not an evaluation workload. Requires hybrid_staging
+                // with split_field=false.
+                bench = "ycsb";
+                ycsb_config.txn_mix = {60, 20, 0, 10, 10};
+                ycsb_config.adversarial_deletes = true;
             }
             else if (bench == "tpccn")
             {

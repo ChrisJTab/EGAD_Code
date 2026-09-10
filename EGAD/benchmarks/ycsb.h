@@ -19,6 +19,9 @@
 #include <benchmarks/ycsb_storage.h>
 #include <benchmarks/recovery_meta.h>
 #include <benchmarks/ycsb_cpu_shadow_index.h>
+#ifdef EGAD_VALIDATION
+#include <benchmarks/ycsb_timeline_oracle.h>
+#endif
 #include <benchmarks/ycsb_index.h>
 #include <benchmarks/ycsb_submitter.h>
 #include <benchmarks/ycsb_executor.h>
@@ -62,6 +65,17 @@ public:
     // a lifetime independent of the GPU index; YcsbGpuIndex holds a
     // reference to it.
     std::unique_ptr<YcsbCpuShadowIndex> cpu_shadow_;
+
+#ifdef EGAD_VALIDATION
+    // Serial-order oracle (EPIC_TIMELINE_ORACLE=1): replays every epoch on
+    // the host and compares each operation's resolved record with the
+    // GPU's; the end-of-run map check compares the GPU index with the
+    // model's live set. Validation build only.
+    std::unique_ptr<YcsbTimelineOracle> oracle_;
+    std::vector<uint8_t> oracle_params_host_;
+    void oracleCheckEpoch(uint32_t epoch_id);
+    void oracleFinalCheck();
+#endif
 
     std::shared_ptr<YcsbIndex> index;
     std::shared_ptr<TableExecutionPlanner> planner;

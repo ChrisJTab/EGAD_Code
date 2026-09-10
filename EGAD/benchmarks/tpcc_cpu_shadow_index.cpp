@@ -105,11 +105,16 @@ TpccCpuShadowIndex::TpccCpuShadowIndex(TpccConfig config, uint32_t maxO_ol)
         && tpcc_config_.txn_mix.delivery > 0) {
         h_no_delete_keys_ = static_cast<NewOrderKey::baseType*>(
             Malloc(static_cast<size_t>(tpcc_config_.num_txns) * 10 * sizeof(NewOrderKey::baseType)));
+        h_no_delete_crids_ = static_cast<uint32_t*>(
+            Malloc(static_cast<size_t>(tpcc_config_.num_txns) * 10 * sizeof(uint32_t)));
         if (durable) {
             durable_no_delete_keys_ = static_cast<NewOrderKey::baseType*>(
                 MallocDurable("tpcc_shadow_no_del_keys",
                               static_cast<size_t>(tpcc_config_.newOrderTableSize()) *
                                   sizeof(NewOrderKey::baseType)));
+            durable_no_delete_crids_ = static_cast<uint32_t*>(
+                MallocDurable("tpcc_shadow_no_del_crids",
+                              static_cast<size_t>(tpcc_config_.newOrderTableSize()) * sizeof(uint32_t)));
         }
     }
 
@@ -129,6 +134,7 @@ TpccCpuShadowIndex::~TpccCpuShadowIndex()
     if (h_o_keys_)  { Free(h_o_keys_);  h_o_keys_  = nullptr; }
     if (h_ol_keys_) { Free(h_ol_keys_); h_ol_keys_ = nullptr; }
     if (h_no_delete_keys_) { Free(h_no_delete_keys_); h_no_delete_keys_ = nullptr; }
+    if (h_no_delete_crids_) { Free(h_no_delete_crids_); h_no_delete_crids_ = nullptr; }
 }
 
 void TpccCpuShadowIndex::loadInitialData()
@@ -274,6 +280,8 @@ void TpccCpuShadowIndex::mirrorEpochNoDeletes(uint32_t num_deletes, uint32_t old
     if (durable_no_delete_keys_) {
         std::memcpy(durable_no_delete_keys_ + old_delete_count, h_no_delete_keys_,
                     static_cast<size_t>(num_deletes) * sizeof(NewOrderKey::baseType));
+        std::memcpy(durable_no_delete_crids_ + old_delete_count, h_no_delete_crids_,
+                    static_cast<size_t>(num_deletes) * sizeof(uint32_t));
     }
 }
 
@@ -299,7 +307,8 @@ void TpccCpuShadowIndex::applyNoDeletesFromDurable(uint32_t count)
     const uint32_t maxO_no = max_o_orders_;
     for (uint32_t j = first; j < count; ++j) {
         NewOrderKey k; k.base_key = durable_no_delete_keys_[j];
-        shadow_no_[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)] = kSentinel;
+        uint32_t& slot = shadow_no_[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)];
+        if (slot == durable_no_delete_crids_[j]) slot = kSentinel;
     }
     Logger::GetInstance().Info("[RECOVER] applied {} NO delete entries from durable shadow log", count);
 }
@@ -344,7 +353,8 @@ uint64_t TpccCpuShadowIndex::noLiveDigestFromLogs(uint32_t ins_count, uint32_t d
     }
     for (uint32_t j = 0; j < del_count; ++j) {
         NewOrderKey k; k.base_key = durable_no_delete_keys_[j];
-        state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)] = kSentinel;
+        uint32_t& slot = state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)];
+        if (slot == durable_no_delete_crids_[j]) slot = kSentinel;
     }
 
     uint64_t acc = 0;
@@ -353,6 +363,44 @@ uint64_t TpccCpuShadowIndex::noLiveDigestFromLogs(uint32_t ins_count, uint32_t d
         if (state[i] != kSentinel) acc += foldNoLiveEntry(static_cast<uint32_t>(i), state[i]);
     }
     return acc;
+}
+
+std::vector<std::pair<NewOrderKey::baseType, uint32_t>> TpccCpuShadowIndex::noLiveStateFromLogs(
+    uint32_t ins_count, uint32_t del_count) const
+{
+    std::vector<std::pair<NewOrderKey::baseType, uint32_t>> out;
+    if ((ins_count > 0 && !durable_no_keys_) || (del_count > 0 && !durable_no_delete_keys_)) return out;
+    const uint32_t W = tpcc_config_.num_warehouses;
+    const uint32_t maxO_no = max_o_orders_;
+    std::vector<uint32_t> state(shadow_no_.size(), kSentinel);
+    for (uint32_t w = 1; w <= W; ++w) {
+        for (uint32_t d = 1; d <= 10; ++d) {
+            const uint32_t no_base = ((w - 1u) * 10u + (d - 1u)) * 900u;
+            for (uint32_t o = 2101; o <= 3000; ++o) {
+                state[denseIdxNO(w, d, o, maxO_no)] = no_base + (o - 2101u);
+            }
+        }
+    }
+    const uint32_t no_init = W * 10u * 900u;
+    for (uint32_t j = 0; j < ins_count; ++j) {
+        NewOrderKey k; k.base_key = durable_no_keys_[j];
+        state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)] = no_init + j;
+    }
+    for (uint32_t j = 0; j < del_count; ++j) {
+        NewOrderKey k; k.base_key = durable_no_delete_keys_[j];
+        uint32_t& slot = state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)];
+        if (slot == durable_no_delete_crids_[j]) slot = kSentinel;
+    }
+    out.reserve(no_init);
+    for (size_t i = 0; i < state.size(); ++i) {
+        if (state[i] == kSentinel) continue;
+        const uint32_t o = static_cast<uint32_t>(i % maxO_no) + 1u;
+        const uint32_t wd = static_cast<uint32_t>(i / maxO_no);
+        NewOrderKey k;
+        k.no_o_id = o; k.no_d_id = wd % 10u + 1u; k.no_w_id = wd / 10u + 1u;
+        out.emplace_back(k.base_key, state[i]);
+    }
+    return out;
 }
 
 void TpccCpuShadowIndex::verifyNoLiveAgainstLogs(uint32_t ins_count, uint32_t del_count) const

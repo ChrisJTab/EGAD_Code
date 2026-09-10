@@ -60,9 +60,13 @@ void __global__ prepareSubmitYcsbTxn(YcsbConfig config, GpuTxnArray txns, uint32
     BaseTxn *base_txn_ptr = txns.getTxn(tid);
     YcsbTxnParam *txn = reinterpret_cast<YcsbTxnParam *>(base_txn_ptr->data);
     uint32_t ops = 0;
-    for (auto &op : txn->ops)
+    for (int i = 0; i < 10; ++i)
     {
-        switch (op)
+        // An op that resolved to no record (its key is absent at the op's
+        // serial position) is not submitted: a read returns nothing, a
+        // write has no effect.
+        if (txn->record_ids[i] == 0xffffffffu) continue;
+        switch (txn->ops[i])
         {
         case YcsbOpType::READ:
             ops += 1;
@@ -145,7 +149,8 @@ void __global__ deriveStagerKeys(const op_t* ops, const uint8_t* op_is_insert, u
 // offsets, so each store scatters across cache lines). The post-hoc derive kernel
 // is indexed by op_idx instead of tid, so its accesses are fully coalesced.
 void __global__ submitYcsbTxn(YcsbConfig config, GpuTxnArray txns, uint32_t *offset,
-                              op_t *ops, uint8_t *op_is_insert, uint32_t num_txns)
+                              op_t *ops, uint8_t *op_is_insert, uint32_t num_txns,
+                              uint32_t minted_begin, uint32_t num_minted)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_txns)
@@ -168,7 +173,12 @@ void __global__ submitYcsbTxn(YcsbConfig config, GpuTxnArray txns, uint32_t *off
 
     for (int i = 0; i < 10; ++i)
     {
-        const bool op_is_insert_kind = (txn->ops[i] == YcsbOpType::INSERT);
+        // Absent at the op's serial position: not submitted (see
+        // prepareSubmitYcsbTxn). An INSERT creates its record only when the
+        // record was minted this epoch; otherwise it writes an existing one.
+        if (txn->record_ids[i] == 0xffffffffu) continue;
+        const bool op_is_insert_kind = (txn->ops[i] == YcsbOpType::INSERT)
+            && (txn->record_ids[i] - minted_begin < num_minted);
         switch (txn->ops[i])
         {
         case YcsbOpType::READ:
@@ -316,7 +326,7 @@ void YcsbGpuSubmitter::submit(TxnArray<YcsbTxnParam> &txn_array)
     submitYcsbTxn<<<num_blocks, block_size>>>(config, GpuTxnArray(txn_array), submit_dest.d_op_offsets,
         reinterpret_cast<op_t *>(submit_dest.d_submitted_ops),
         submit_dest.d_op_is_insert,
-        config.num_txns);
+        config.num_txns, minted_begin_, num_minted_);
 
     gpu_err_check(cudaGetLastError());
 

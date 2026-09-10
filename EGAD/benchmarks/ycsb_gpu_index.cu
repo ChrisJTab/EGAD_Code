@@ -3,11 +3,14 @@
 //
 
 #include <cmath>
+#include <cstdlib>
 #include <memory>
+#include <vector>
 #include <cuda/std/atomic>
 
 #include <thrust/device_vector.h>
 #include <thrust/equal.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/sequence.h>
 #include <thrust/transform.h>
@@ -15,6 +18,7 @@
 #include <benchmarks/ycsb_gpu_index.h>
 #include <benchmarks/tpcc_gpu_index.h>
 #include <benchmarks/tpcc_table.h>
+#include <benchmarks/epoch_timeline.cuh>
 #include <gpu_txn.cuh>
 #include <util_log.h>
 #include <util_gpu_error_check.cuh>
@@ -29,15 +33,26 @@ namespace {
 
 using YcsbIndexType = cuco::static_map<uint32_t, uint32_t>;
 using YcsbIndexDeviceView = YcsbIndexType::device_view;
+using epic::timeline::kAbsent;
 
 struct IsNotSentinel {
     __device__ bool operator()(uint32_t x) const {
-        return x != 0xffffffffu; // matches what prepareYcsbIndexKernel writes for non-insert
+        return x != kAbsent; // matches what k_extract_ops writes for slots that are not of the kind
     }
 };
 
+// Predicate over slot indices: the slot holds a non-sentinel entry of the
+// bound per-slot array. Used to compact slot indices in slot order
+// alongside the key compaction that uses IsNotSentinel.
+struct SlotHolds {
+    const uint32_t* keys;
+    __device__ bool operator()(uint32_t slot) const { return keys[slot] != kAbsent; }
+};
 
-void __global__ prepareYcsbIndexKernel(GpuTxnArray txns, uint32_t *insert, uint32_t num_txns)
+// Per-slot extraction of the epoch's index events. Slot = tid * 10 + i, the
+// operation's serial position. insert[slot] / del[slot] carry the key of an
+// INSERT / DELETE op and kAbsent otherwise; ev[slot] is 1 for either.
+void __global__ k_extract_ops(GpuTxnArray txns, uint32_t *insert, uint32_t *del, uint32_t *pos, uint32_t num_txns)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_txns)
@@ -49,51 +64,22 @@ void __global__ prepareYcsbIndexKernel(GpuTxnArray txns, uint32_t *insert, uint3
     int base = tid * 10; // each txn has 10 ops
     for (int i = 0; i < 10; ++i)
     {
-        if (txn->ops[i] == YcsbOpType::INSERT)
-        {
-            uint32_t key = txn->keys[i];
-            insert[base + i] = key;
-        }
-        else
-        {
-            insert[base + i] = static_cast<uint32_t>(-1);
-        }
-    }
-}
-
-// Emit the epoch's delete set. For each DELETE op, writes the key and its
-// resolved CRID (from the params the lookup kernel just filled) into
-// per-op-slot arrays and raises the slot's flag; DeviceSelect::Flagged
-// compacts both arrays with the same flags, preserving op order, so the
-// durable delete log's append order is deterministic.
-void __global__ prepareYcsbDeleteKernel(GpuTxnArray txns, GpuTxnArray params,
-    uint32_t *keys, uint32_t *crids, uint8_t *flags, uint32_t num_txns)
-{
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_txns)
-    {
-        return;
-    }
-    YcsbTxn *txn = reinterpret_cast<YcsbTxn *>(txns.getTxn(tid)->data);
-    YcsbTxnParam *param = reinterpret_cast<YcsbTxnParam *>(params.getTxn(tid)->data);
-    int base = tid * 10;
-    for (int i = 0; i < 10; ++i)
-    {
-        const bool is_delete = txn->ops[i] == YcsbOpType::DELETE;
-        flags[base + i] = is_delete ? 1 : 0;
-        if (is_delete)
-        {
-            keys[base + i] = txn->keys[i];
-            crids[base + i] = param->record_ids[i];
-        }
+        const YcsbOpType op = txn->ops[i];
+        const uint32_t key = txn->keys[i];
+        insert[base + i] = (op == YcsbOpType::INSERT) ? key : kAbsent;
+        del[base + i]    = (op == YcsbOpType::DELETE) ? key : kAbsent;
+        if (pos) pos[base + i] = base + i;
     }
 }
 
 // Translate each op's key to its record id via the index, copying ops and
-// field ids through to the executor-facing params.
-void __global__ indexYcsbKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDeviceView index_view, uint32_t num_txns)
+// field ids through to the executor-facing params. A key the index does not
+// hold resolves to kAbsent. Fast path (no delete events this epoch): a
+// record minted this epoch is visible only to the operations at or after
+// the slot of its insert; earlier ones resolve to kAbsent.
+void __global__ indexYcsbKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDeviceView index_view, uint32_t num_txns,
+                                uint32_t minted_begin, uint32_t num_minted, const uint32_t* __restrict__ ins_slot)
 {
-
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_txns)
     {
@@ -106,16 +92,50 @@ void __global__ indexYcsbKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDev
 
     for (int i = 0; i < 10; ++i)
     {
+        uint32_t rid = kAbsent;
         auto record_found = index_view.find(txn_ptr->keys[i]);
         if (record_found != index_view.end())
         {
-            index_ptr->record_ids[i] = record_found->second.load(cuda::std::memory_order_relaxed);
+            rid = record_found->second.load(cuda::std::memory_order_relaxed);
         }
-        else
+        if (rid != kAbsent && rid - minted_begin < num_minted)
         {
-            printf("record not found\n");
-            assert(false);
+            if (static_cast<uint32_t>(tid * 10 + i) < ins_slot[rid - minted_begin]) rid = kAbsent;
         }
+        index_ptr->record_ids[i] = rid;
+        index_ptr->ops[i] = txn_ptr->ops[i];
+        index_ptr->field_ids[i] = txn_ptr->fields[i];
+    }
+}
+
+// General path (delete events this epoch): the epoch-start lookup is the
+// fallback for keys without events; keys with events resolve against their
+// timeline at the op's slot.
+void __global__ indexYcsbTimelineKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDeviceView index_view,
+                                        uint32_t num_txns, epic::timeline::TimelineView<32> tl)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_txns)
+    {
+        return;
+    }
+    BaseTxn *base_txn_ptr = txn.getTxn(tid);
+    BaseTxn *base_index_ptr = index.getTxn(tid);
+    YcsbTxn *txn_ptr = reinterpret_cast<YcsbTxn *>(base_txn_ptr->data);
+    YcsbTxnParam *index_ptr = reinterpret_cast<YcsbTxnParam *>(base_index_ptr->data);
+
+    for (int i = 0; i < 10; ++i)
+    {
+        const uint32_t key = txn_ptr->keys[i];
+        uint32_t rid = kAbsent;
+        auto record_found = index_view.find(key);
+        if (record_found != index_view.end())
+        {
+            rid = record_found->second.load(cuda::std::memory_order_relaxed);
+        }
+        const uint32_t slot = static_cast<uint32_t>(tid * 10 + i);
+        rid = tl.resolve(key, slot, slot, txn_ptr->ops[i] == YcsbOpType::INSERT, rid);
+        index_ptr->record_ids[i] = rid;
         index_ptr->ops[i] = txn_ptr->ops[i];
         index_ptr->field_ids[i] = txn_ptr->fields[i];
     }
@@ -125,8 +145,6 @@ class YcsbGpuIndexImpl
 {
 public:
     static constexpr double load_factor = 0.8;
-//    static constexpr cuco::empty_key<uint32_t> empty_key_sentinel{static_cast<uint32_t>(-1)};
-//    static constexpr cuco::empty_value<uint32_t> empty_value_sentinel{static_cast<uint32_t>(-1)};
         static constexpr cuco::empty_key<uint32_t> empty_key_sentinel{0xffffffff};
         static constexpr cuco::empty_value<uint32_t> empty_value_sentinel{0xffffffff};
         // Erased-slot sentinel for the delete path. Passed at BOTH map
@@ -140,12 +158,12 @@ public:
     // === CPU shadow index reference ===
     //
     // The host-side shadow (12 sharded maps, rollback snapshots, the
-    // pinned host buffer for D2H of insert keys) lives in YcsbBenchmark
-    // as a YcsbCpuShadowIndex. This class holds a reference. The shadow
-    // is the host-side ground truth: after a crash, recovery repopulates
-    // a fresh GPU index from it. Declared here (next to ycsb_config,
-    // before the cuco map) so the ctor's member-init list order matches
-    // declaration order.
+    // pinned host buffers for D2H of insert and delete keys) lives in
+    // YcsbBenchmark as a YcsbCpuShadowIndex. This class holds a reference.
+    // The shadow is the host-side ground truth: after a crash, recovery
+    // repopulates a fresh GPU index from it. Declared here (next to
+    // ycsb_config, before the cuco map) so the ctor's member-init list order
+    // matches declaration order.
     YcsbCpuShadowIndex& shadow_;
 
     std::shared_ptr<YcsbIndexType> index;
@@ -155,28 +173,34 @@ public:
     thrust::device_ptr<uint32_t> dp_free_rows;
     uint32_t free_start = 0;
 
-    uint32_t *d_inserts, *d_valid_inserts;
-    thrust::device_ptr<uint32_t> dp_inserts, dp_valid_inserts;
+    // Per-slot op columns (n_slots = num_txns * ops per txn): the key of an
+    // INSERT / DELETE op at that slot (kAbsent otherwise) and the event flag.
+    uint32_t *d_inserts = nullptr, *d_valid_inserts = nullptr;
+    uint32_t *d_deletes = nullptr, *d_valid_deletes = nullptr;
+    thrust::device_ptr<uint32_t> dp_inserts, dp_valid_inserts, dp_valid_deletes;
+    // Slot of the j-th minted insert (slot order); the visibility bound of
+    // the record minted this epoch as CRID minted_begin_ + j.
+    uint32_t *d_ins_slot = nullptr;
     uint32_t *d_num_insert;      // device-accessible pointer (mapped)
     uint32_t *h_num_insert;      // host-accessible pointer (mapped, same physical memory)
+    uint32_t *d_num_delete = nullptr;   // mapped device pointer
+    uint32_t *h_num_delete = nullptr;   // mapped host pointer (same memory)
+    uint32_t minted_begin_ = 0;          // first CRID minted this epoch
+    uint32_t num_minted_this_epoch = 0;
+    uint32_t delete_count = 0;           // cumulative; the durable delete-log cursor
+    uint32_t num_deletes_this_epoch = 0;
+    uint32_t *d_valid_delete_crids = nullptr;   // fast-path undo scratch
 
     void *d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
 
-    // Delete-set scratch, allocated only for delete-bearing mixes
-    // (nullptr otherwise; mixes without deletes never run the delete
-    // block). Per-op-slot key/CRID arrays + flags, their Flagged-compacted
-    // outputs, a mapped count, and the cumulative delete-log cursor.
-    uint32_t *d_deletes = nullptr, *d_valid_deletes = nullptr;
-    uint32_t *d_delete_crids = nullptr, *d_valid_delete_crids = nullptr;
-    uint8_t *d_delete_flags = nullptr;
-    thrust::device_ptr<uint32_t> dp_valid_deletes;
-    uint32_t *d_num_delete = nullptr;   // mapped device pointer
-    uint32_t *h_num_delete = nullptr;   // mapped host pointer (same memory)
-    uint32_t delete_count = 0;          // cumulative; the durable delete-log cursor
-    uint32_t num_deletes_this_epoch = 0;
-    void *d_flagged_temp = nullptr;
-    size_t flagged_temp_bytes = 0;
+    // === Timeline (general path) ===
+    // Built at construction for delete-bearing mixes and on first use
+    // otherwise (a duplicate or existing key among an epoch's inserts sends
+    // that epoch through the general path). Entry = slot; PosBits = 32.
+    uint32_t n_slots_ = 0;
+    epic::timeline::EpochTimeline<uint32_t, 32> tl_;
+    void ensureTimeline() { tl_.ensure(n_slots_, n_slots_); }
 
     explicit YcsbGpuIndexImpl(YcsbConfig ycsb_config, YcsbCpuShadowIndex& shadow)
         : ycsb_config(ycsb_config)
@@ -191,40 +215,47 @@ public:
         const uint32_t remaining = ycsb_config.num_records - ycsb_config.starting_num_records;
         gpu_err_check(cudaMalloc(&d_free_rows, sizeof(uint32_t) * remaining));
         dp_free_rows = thrust::device_pointer_cast(d_free_rows);
-        // Insert-key scratch, sized to the worst case (every op an INSERT);
-        // DeviceSelect::If compacts the real inserts into d_valid_inserts.
-        gpu_err_check(cudaMalloc(&d_inserts, sizeof(uint32_t) * ycsb_config.num_txns * ycsb_config.num_ops_per_txn));
-        gpu_err_check(
-            cudaMalloc(&d_valid_inserts, sizeof(uint32_t) * ycsb_config.num_txns * ycsb_config.num_ops_per_txn));
+        n_slots_ = static_cast<uint32_t>(ycsb_config.num_txns * ycsb_config.num_ops_per_txn);
+        // Per-slot op columns and their compactions, sized to the worst case
+        // (every op an INSERT, or every op a DELETE).
+        gpu_err_check(cudaMalloc(&d_inserts, sizeof(uint32_t) * n_slots_));
+        gpu_err_check(cudaMalloc(&d_valid_inserts, sizeof(uint32_t) * n_slots_));
+        gpu_err_check(cudaMalloc(&d_deletes, sizeof(uint32_t) * n_slots_));
+        gpu_err_check(cudaMalloc(&d_valid_deletes, sizeof(uint32_t) * n_slots_));
+        gpu_err_check(cudaMalloc(&d_valid_delete_crids, sizeof(uint32_t) * n_slots_));
+        gpu_err_check(cudaMalloc(&d_ins_slot, sizeof(uint32_t) * n_slots_));
         dp_inserts = thrust::device_pointer_cast(d_inserts);
         dp_valid_inserts = thrust::device_pointer_cast(d_valid_inserts);
+        dp_valid_deletes = thrust::device_pointer_cast(d_valid_deletes);
         gpu_err_check(cudaHostAlloc(&h_num_insert, sizeof(uint32_t), cudaHostAllocMapped));
         gpu_err_check(cudaHostGetDevicePointer(&d_num_insert, h_num_insert, 0));
-        // Allocate temp storage for cub::DeviceSelect::If to filter out the non-insert ops
+        gpu_err_check(cudaHostAlloc(&h_num_delete, sizeof(uint32_t), cudaHostAllocMapped));
+        *h_num_delete = 0;
+        gpu_err_check(cudaHostGetDevicePointer(&d_num_delete, h_num_delete, 0));
+        // Temp storage for the cub compactions: one allocation covering the
+        // largest of the calls this class issues (all over n_slots items).
+        size_t need = 0, bytes = 0;
         IsNotSentinel pred{};
-        cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, dp_inserts, dp_valid_inserts, d_num_insert,
-            ycsb_config.num_txns * ycsb_config.num_ops_per_txn, pred);
-
+        cub::DeviceSelect::If(nullptr, bytes, dp_inserts, dp_valid_inserts, d_num_insert, n_slots_, pred);
+        need = std::max(need, bytes); bytes = 0;
+        SlotHolds holds{d_inserts};
+        cub::DeviceSelect::If(nullptr, bytes, thrust::counting_iterator<uint32_t>(0), d_ins_slot, d_num_insert, n_slots_, holds);
+        need = std::max(need, bytes); bytes = 0;
+        temp_storage_bytes = need;
         logger.Trace("Allocating {} bytes for temp storage", formatSizeBytes(temp_storage_bytes));
         gpu_err_check(cudaMalloc(&d_temp_storage, temp_storage_bytes));
 
-        // Delete-set scratch, delete-bearing mixes only.
         if (ycsb_config.txn_mix.num_deletes > 0) {
-            const size_t n_slots =
-                static_cast<size_t>(ycsb_config.num_txns) * ycsb_config.num_ops_per_txn;
-            gpu_err_check(cudaMalloc(&d_deletes, sizeof(uint32_t) * n_slots));
-            gpu_err_check(cudaMalloc(&d_valid_deletes, sizeof(uint32_t) * n_slots));
-            gpu_err_check(cudaMalloc(&d_delete_crids, sizeof(uint32_t) * n_slots));
-            gpu_err_check(cudaMalloc(&d_valid_delete_crids, sizeof(uint32_t) * n_slots));
-            gpu_err_check(cudaMalloc(&d_delete_flags, sizeof(uint8_t) * n_slots));
-            dp_valid_deletes = thrust::device_pointer_cast(d_valid_deletes);
-            gpu_err_check(cudaHostAlloc(&h_num_delete, sizeof(uint32_t), cudaHostAllocMapped));
-            *h_num_delete = 0;
-            gpu_err_check(cudaHostGetDevicePointer(&d_num_delete, h_num_delete, 0));
-            cub::DeviceSelect::Flagged(d_flagged_temp, flagged_temp_bytes,
-                d_deletes, d_delete_flags, d_valid_deletes, d_num_delete, n_slots);
-            gpu_err_check(cudaMalloc(&d_flagged_temp, flagged_temp_bytes));
+            ensureTimeline();
         }
+#ifdef EGAD_VALIDATION
+        // Validation control: the timeline resolves order-blind, as the
+        // epoch-boundary semantics did; the oracle must reject it.
+        if (std::getenv("EPIC_TIMELINE_ORDER_BLIND") != nullptr) {
+            tl_.setOrderBlind(true);
+            logger.Info("[TIMELINE] ORDER-BLIND control active");
+        }
+#endif
 
         // CPU shadow allocation now lives in YcsbCpuShadowIndex's ctor
         // (host-side, owned by YcsbBenchmark). This class just holds a
@@ -294,94 +325,201 @@ public:
         // epoch so free_start_prev2_ holds the rollback target f_{E-2}
         // throughout this entire epoch (indexTxns, execution, flush).
         // Captures the value that was durable at the end of epochs
-        // E-1 and E-2 before any of this epoch's bulk_insert
-        // increments the cursor.
+        // E-1 and E-2 before any of this epoch's inserts increment the
+        // cursor.
         shadow_.shiftSnapshotsAtEpochStart(free_start);
 
         constexpr uint32_t block_size = 512;
+        const uint32_t n_slots = n_slots_;
+        const uint32_t txn_blocks = (ycsb_config.num_txns + block_size - 1) / block_size;
 
-        prepareYcsbIndexKernel<<<(ycsb_config.num_txns + block_size - 1) / block_size, block_size>>>(
-            GpuTxnArray(txn_array), d_inserts, ycsb_config.num_txns);
+        k_extract_ops<<<txn_blocks, block_size>>>(GpuTxnArray(txn_array), d_inserts, d_deletes, nullptr,
+                                                  ycsb_config.num_txns);
         gpu_err_check(cudaPeekAtLastError());
         gpu_err_check(cudaStreamSynchronize(0));
 
-        // This filters d_inserts into d_valid_inserts, removing all -1u(0xffffffff) entries
-        // d_num_insert will contain the number of valid inserts found
-        IsNotSentinel pred{};
-        cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, d_inserts, d_valid_inserts, d_num_insert,
-            ycsb_config.num_txns * ycsb_config.num_ops_per_txn, pred);
+        num_deletes_this_epoch = 0;
+        num_minted_this_epoch = 0;
+        minted_begin_ = ycsb_config.starting_num_records + free_start;
 
-        gpu_err_check(cudaStreamSynchronize(0));
-        uint32_t num_inserts = *h_num_insert;  // read directly from mapped memory, no D2H needed
-
-        logger.Info("Found {} inserts", num_inserts);
-        const uint32_t free_total = ycsb_config.num_records - ycsb_config.starting_num_records;
-        uint32_t want = num_inserts;
-        uint32_t have = (free_start < free_total) ? (free_total - free_start) : 0;
-        uint32_t take = std::min(want, have);
-
-        if (take == 0 && want > 0)
+        bool general = ycsb_config.txn_mix.num_deletes > 0;
+#ifdef EGAD_VALIDATION
+        // Validation hook: resolve every epoch through the timeline, so the
+        // workloads without deletes exercise it and must reproduce the fast
+        // path's results exactly.
+        static const bool kForceGeneral = std::getenv("EPIC_TIMELINE_FORCE_GENERAL") != nullptr;
+        if (kForceGeneral) general = true;
+#endif
+        if (!general)
         {
-            logger.Error("Out of free rows for inserts! want: {}, have: {}", want, have);
-            throw std::runtime_error("Out of free rows for inserts");
+            // Fast path: the epoch's inserts create records, every other op
+            // resolves on the epoch-start index plus those records. The
+            // minting rule is the j-th INSERT in slot order.
+            IsNotSentinel pred{};
+            cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, dp_inserts, dp_valid_inserts, d_num_insert,
+                n_slots, pred);
+            SlotHolds holds{d_inserts};
+            cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, thrust::counting_iterator<uint32_t>(0), d_ins_slot,
+                d_num_insert, n_slots, holds);
+            gpu_err_check(cudaStreamSynchronize(0));
+            const uint32_t num_inserts = *h_num_insert;  // read directly from mapped memory, no D2H needed
+            logger.Info("Found {} inserts", num_inserts);
+            checkFreeRows(num_inserts);
+            if (num_inserts > 0)
+            {
+                // Insert-if-absent. An insert of a key the index already holds,
+                // or a second insert of the same new key in this epoch, is
+                // rejected; the accepted count is visible in the map size.
+                const std::size_t size_before = index->get_size();
+                auto zipped_inserts =
+                    thrust::make_zip_iterator(thrust::make_tuple(dp_valid_inserts, dp_free_rows + free_start));
+                index->insert(zipped_inserts, zipped_inserts + num_inserts);
+                const std::size_t accepted = index->get_size() - size_before;
+                if (accepted != num_inserts)
+                {
+                    // Rejected inserts: undo the accepted ones and resolve the
+                    // epoch through the timeline, which handles duplicate and
+                    // existing keys in serial order and mints only for the
+                    // life-creating inserts.
+                    logger.Info("Epoch {}: {} of {} inserts rejected, resolving through the timeline",
+                                epoch_id, num_inserts - accepted, num_inserts);
+                    undoAcceptedInserts(num_inserts);
+                    general = true;
+                }
+                else
+                {
+                    num_minted_this_epoch = num_inserts;
+                }
+            }
+            if (!general)
+            {
+                indexYcsbKernel<<<txn_blocks, block_size>>>(GpuTxnArray(txn_array), GpuTxnArray(index_array),
+                    index_view, ycsb_config.num_txns, minted_begin_, num_minted_this_epoch, d_ins_slot);
+                gpu_err_check(cudaPeekAtLastError());
+                gpu_err_check(cudaStreamSynchronize(0));
+            }
+        }
+        if (general)
+        {
+            resolveThroughTimeline(txn_array, index_array, epoch_id);
         }
 
-        // assign crids to those keys
-        auto zipped_inserts =
-            thrust::make_zip_iterator(thrust::make_tuple(dp_valid_inserts, dp_free_rows + free_start));
-        index->insert(zipped_inserts, zipped_inserts + take);
+        const uint32_t take = num_minted_this_epoch;
         free_start += take;
         logger.Trace("Free rows used: {}", free_start);
-        // Now that the inserts are in there, we can translate every txn's key to a record_id for execution
-        indexYcsbKernel<<<(ycsb_config.num_txns + block_size - 1) / block_size, block_size>>>(
-            GpuTxnArray(txn_array), GpuTxnArray(index_array), index_view, ycsb_config.num_txns);
-        gpu_err_check(cudaPeekAtLastError());
-        gpu_err_check(cudaStreamSynchronize(0));
 
-        // Mirror this epoch's INSERTs into the CPU shadow. D2H the
-        // insert keys into the shadow's pinned host buffer, then
-        // delegate the host-side mirror update to YcsbCpuShadowIndex.
-        // The D2H is on the default stream so it implicitly drains the
-        // GPU bulk_insert issued above.
+        // Mirror this epoch's minted inserts into the CPU shadow's durable
+        // insert log: D2H the keys (slot order, j-th key <-> CRID
+        // minted_begin_ + j) into the shadow's pinned host buffer, then
+        // delegate the append to YcsbCpuShadowIndex. The D2H is on the
+        // default stream so it drains the GPU work issued above.
         if (take > 0) {
             const uint32_t old_free_start = free_start - take;
             gpu_err_check(cudaMemcpy(
-                shadow_.h_insert_keys(), d_valid_inserts,
+                shadow_.h_insert_keys(), general ? tl_.mintedKeys() : d_valid_inserts,
                 take * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             shadow_.mirrorEpoch(take, old_free_start);
         }
 
-        // Delete application, after this epoch's lookups so every
-        // transaction of the epoch still resolves the key (epoch-boundary
-        // visibility); no transaction of the next epoch can. Emits the
-        // op-ordered delete set, erases the keys from the cuco map, and
-        // appends the keys to the durable delete log. The compacted CRID
-        // list stays on device for the stager's reclaim-first marking.
-        if (ycsb_config.txn_mix.num_deletes > 0) {
-            const size_t n_slots =
-                static_cast<size_t>(ycsb_config.num_txns) * ycsb_config.num_ops_per_txn;
-            prepareYcsbDeleteKernel<<<(ycsb_config.num_txns + block_size - 1) / block_size, block_size>>>(
-                GpuTxnArray(txn_array), GpuTxnArray(index_array),
-                d_deletes, d_delete_crids, d_delete_flags, ycsb_config.num_txns);
-            gpu_err_check(cudaPeekAtLastError());
-            cub::DeviceSelect::Flagged(d_flagged_temp, flagged_temp_bytes,
-                d_deletes, d_delete_flags, d_valid_deletes, d_num_delete, n_slots);
-            cub::DeviceSelect::Flagged(d_flagged_temp, flagged_temp_bytes,
-                d_delete_crids, d_delete_flags, d_valid_delete_crids, d_num_delete, n_slots);
-            gpu_err_check(cudaStreamSynchronize(0));
-            const uint32_t num_deletes = *h_num_delete;
-            num_deletes_this_epoch = num_deletes;
-            logger.Info("Found {} deletes", num_deletes);
-            if (num_deletes > 0) {
-                index->erase(dp_valid_deletes, dp_valid_deletes + num_deletes);
-                gpu_err_check(cudaStreamSynchronize(0));
-                gpu_err_check(cudaMemcpy(
-                    shadow_.h_delete_keys(), d_valid_deletes,
-                    num_deletes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-                shadow_.mirrorEpochDeletes(num_deletes, delete_count);
-                delete_count += num_deletes;
-            }
+        // Effective deletes: the keys leave the index at the epoch boundary
+        // (done inside the timeline finalize), their (key, CRID) pairs go to
+        // the durable delete log, and the CRID list stays on device for the
+        // stager's reclaim-first marking.
+        if (num_deletes_this_epoch > 0) {
+            logger.Info("Found {} deletes", num_deletes_this_epoch);
+            gpu_err_check(cudaMemcpy(
+                shadow_.h_delete_keys(), tl_.edelKeys(),
+                num_deletes_this_epoch * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            gpu_err_check(cudaMemcpy(
+                shadow_.h_delete_crids(), tl_.edelCrids(),
+                num_deletes_this_epoch * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            shadow_.mirrorEpochDeletes(num_deletes_this_epoch, delete_count);
+            delete_count += num_deletes_this_epoch;
+        } else if (ycsb_config.txn_mix.num_deletes > 0) {
+            logger.Info("Found 0 deletes");
         }
+    }
+
+    void checkFreeRows(uint32_t want)
+    {
+        const uint32_t free_total = ycsb_config.num_records - ycsb_config.starting_num_records;
+        const uint32_t have = (free_start < free_total) ? (free_total - free_start) : 0;
+        if (want > have)
+        {
+            Logger::GetInstance().Error("Out of free rows for inserts! want: {}, have: {}", want, have);
+            throw std::runtime_error("Out of free rows for inserts");
+        }
+    }
+
+    // Fast-path undo: the bulk insert accepted an unknown subset of this
+    // epoch's insert keys with their tentative CRIDs. A key whose lookup
+    // returns a tentative CRID was accepted; erase those so the index is
+    // back at its epoch-start state before the timeline resolves the epoch.
+    void undoAcceptedInserts(uint32_t num_inserts)
+    {
+        thrust::device_ptr<uint32_t> dp_found(d_valid_delete_crids);   // scratch, unused on the fast path
+        thrust::device_ptr<uint32_t> dp_erase(d_valid_deletes);
+        index->find(dp_valid_inserts, dp_valid_inserts + num_inserts, dp_found);
+        const uint32_t tentative_begin = minted_begin_;
+        auto is_tentative = [tentative_begin, num_inserts] __device__ (uint32_t v) {
+            return v - tentative_begin < num_inserts;
+        };
+        auto end = thrust::copy_if(dp_valid_inserts, dp_valid_inserts + num_inserts, dp_found, dp_erase, is_tentative);
+        const uint32_t n_erase = static_cast<uint32_t>(end - dp_erase);
+        if (n_erase > 0) {
+            index->erase(dp_erase, dp_erase + n_erase);
+        }
+        gpu_err_check(cudaStreamSynchronize(0));
+    }
+
+    // General path: build the epoch's timelines, mint CRIDs for the
+    // life-creating inserts, resolve every op at its slot, then apply each
+    // key's final state to the index.
+    void resolveThroughTimeline(TxnArray<YcsbTxn> &txn_array, TxnArray<YcsbTxnParam> &index_array, uint32_t epoch_id)
+    {
+        auto &logger = Logger::GetInstance();
+        ensureTimeline();
+        constexpr uint32_t block_size = 512;
+        const uint32_t txn_blocks = (ycsb_config.num_txns + block_size - 1) / block_size;
+
+        k_extract_ops<<<txn_blocks, block_size>>>(GpuTxnArray(txn_array), tl_.insKeys(), tl_.delKeys(), tl_.pos(),
+                                                  ycsb_config.num_txns);
+        gpu_err_check(cudaPeekAtLastError());
+        gpu_err_check(cudaStreamSynchronize(0));
+        tl_.build([this](const uint32_t* keys, uint32_t n, uint32_t* out) {
+                thrust::device_ptr<const uint32_t> k(keys);
+                thrust::device_ptr<uint32_t> o(out);
+                index->find(k, k + n, o);
+            }, minted_begin_);
+        const uint32_t num_minted = tl_.numMinted();
+        logger.Info("Found {} inserts", num_minted);
+        checkFreeRows(num_minted);
+        num_minted_this_epoch = num_minted;
+
+        // Resolve every op: epoch-start lookup, overridden by the timeline
+        // for keys with events.
+        indexYcsbTimelineKernel<<<txn_blocks, block_size>>>(GpuTxnArray(txn_array), GpuTxnArray(index_array), index_view,
+            ycsb_config.num_txns, tl_.view());
+        gpu_err_check(cudaPeekAtLastError());
+        gpu_err_check(cudaStreamSynchronize(0));
+
+        num_deletes_this_epoch = tl_.numEffectiveDeletes();
+        // Index update at the epoch boundary: erase the keys that end absent
+        // or replaced, then insert the final lives minted this epoch.
+        const uint32_t n_erase = tl_.numErase(), n_ins = tl_.numInsert();
+        if (n_erase > 0) {
+            thrust::device_ptr<const uint32_t> k(tl_.eraseKeys());
+            index->erase(k, k + n_erase);
+        }
+        if (n_ins > 0) {
+            thrust::device_ptr<const uint32_t> k(tl_.insertKeys());
+            thrust::device_ptr<const uint32_t> v(tl_.insertCrids());
+            auto zipped = thrust::make_zip_iterator(thrust::make_tuple(k, v));
+            index->insert(zipped, zipped + n_ins);
+        }
+        gpu_err_check(cudaStreamSynchronize(0));
+        logger.Trace("Epoch {} timeline: events={} minted={} effective_deletes={} erased={} inserted={}",
+                     epoch_id, tl_.numEvents(), num_minted, num_deletes_this_epoch, n_erase, n_ins);
     }
 
     void rebuildCucoFromShadow(uint32_t current_free_start, uint32_t current_delete_count)
@@ -505,7 +643,7 @@ uint32_t YcsbGpuIndex::getDeleteCount() const
 const uint32_t* YcsbGpuIndex::deleteCridsDevice() const
 {
     auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
-    return impl.d_valid_delete_crids;
+    return impl.tl_.ready() ? impl.tl_.edelCrids() : nullptr;
 }
 
 uint32_t YcsbGpuIndex::numDeletesThisEpoch() const
@@ -513,4 +651,66 @@ uint32_t YcsbGpuIndex::numDeletesThisEpoch() const
     auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
     return impl.num_deletes_this_epoch;
 }
+
+uint32_t YcsbGpuIndex::mintedBegin() const
+{
+    auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
+    return impl.minted_begin_;
+}
+
+uint32_t YcsbGpuIndex::numMintedThisEpoch() const
+{
+    auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
+    return impl.num_minted_this_epoch;
+}
+
+#ifdef EGAD_VALIDATION
+uint32_t YcsbGpuIndex::verifyLiveMapping(const std::vector<uint32_t>& keys, const std::vector<uint32_t>& expected,
+                                         const std::vector<uint32_t>& dead) const
+{
+    auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
+    auto &logger = Logger::GetInstance();
+    uint32_t mismatches = 0, dead_found = 0;
+    constexpr size_t kBatch = 1u << 20;
+    thrust::device_vector<uint32_t> d_keys(kBatch), d_out(kBatch);
+    std::vector<uint32_t> h_out(kBatch);
+    for (size_t off = 0; off < keys.size(); off += kBatch) {
+        const size_t n = std::min(kBatch, keys.size() - off);
+        thrust::copy(keys.begin() + off, keys.begin() + off + n, d_keys.begin());
+        impl.index->find(d_keys.begin(), d_keys.begin() + n, d_out.begin());
+        thrust::copy(d_out.begin(), d_out.begin() + n, h_out.begin());
+        for (size_t i = 0; i < n; ++i) {
+            if (h_out[i] != expected[off + i]) {
+                if (mismatches < 10) {
+                    logger.Error("[MAP-CHECK] key {} expected {} found {}", keys[off + i], expected[off + i],
+                                 static_cast<int64_t>(h_out[i] == kAbsent ? -1 : static_cast<int64_t>(h_out[i])));
+                }
+                ++mismatches;
+            }
+        }
+    }
+    for (size_t off = 0; off < dead.size(); off += kBatch) {
+        const size_t n = std::min(kBatch, dead.size() - off);
+        thrust::copy(dead.begin() + off, dead.begin() + off + n, d_keys.begin());
+        impl.index->find(d_keys.begin(), d_keys.begin() + n, d_out.begin());
+        thrust::copy(d_out.begin(), d_out.begin() + n, h_out.begin());
+        for (size_t i = 0; i < n; ++i) {
+            if (h_out[i] != kAbsent) {
+                if (dead_found < 10) logger.Error("[MAP-CHECK] dead key {} still maps to {}", dead[off + i], h_out[i]);
+                ++dead_found;
+            }
+        }
+    }
+    const uint32_t violations = mismatches + dead_found;
+    if (violations == 0) {
+        logger.Info("[MAP-CHECK] PASS ycsb live={} dead_probed={} (index agrees with the serial-order model)",
+                    keys.size(), dead.size());
+    } else {
+        logger.Error("[MAP-CHECK] FAILED ycsb live={} mismatches={} dead_probed={} dead_found={}",
+                     keys.size(), mismatches, dead.size(), dead_found);
+    }
+    return violations;
+}
+#endif // EGAD_VALIDATION
+
 } // namespace epic::ycsb

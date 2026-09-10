@@ -63,6 +63,11 @@ struct YcsbConfig
     uint32_t cpu_exec_num_threads = 1;
     uint32_t gpu_capacity = 0;
     bool overlap_flush = false;
+    // Validation workload (ycsbx): on top of the sliding-window delete mix,
+    // plant transactions that read, write, delete and re-insert the same
+    // keys inside one epoch and across epochs, so the serial-order
+    // resolution of deletes and inserts is exercised on purpose.
+    bool adversarial_deletes = false;
 
     // Read bias toward recently-inserted CRIDs. With probability
     // recent_read_bias, a non-insert op draws its key uniformly from

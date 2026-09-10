@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cstring>   // std::memcmp (placement-invariant values-only hash)
 #include <random>
+#include <unordered_set>
+#include <stdexcept>
 #include <util_log.h>
 #include <benchmarks/ycsb.h>
 #include <benchmarks/ycsb_txn.h>
@@ -19,6 +21,135 @@
 #include <benchmarks/ycsb_cpu_executor.h>
 #include <util_gpu_transfer.h>
 #include <util_memory.h>
+
+namespace {
+
+// ycsbx: plant transactions that exercise the serial-order semantics of
+// deletes and inserts on purpose, on top of the sliding-window churn of
+// ycsbw. Every 50th transaction starts a block of four transactions owned
+// by one pattern (block index mod 10 selects it). The pattern's key is a
+// live key from the upper part of the window at that epoch, so the churn's
+// tail delete cannot reach it during a schedule; fresh keys come from above
+// the churn's final head; a never-inserted key lies beyond the record
+// universe. Cross-epoch patterns start every fifth epoch. Deterministic
+// from the seed. The oracle (validation build) defines the expected
+// outcome of every operation, so the patterns only need coverage:
+//   0 read after delete (later transaction), then update and read
+//   1 delete, then re-insert in a later transaction, then read and update
+//   2 read, delete, read, insert, read, update inside one transaction
+//   3 insert of a fresh key, read and update, delete, read (born dead)
+//   4 read before the insert of a fresh key, insert, read
+//   5 insert of a live key (a write), then read and update
+//   6 delete twice, and read, update, delete of a never-inserted key
+//   7 delete, insert, delete, insert, read inside one transaction
+//   8 cross-epoch: delete at e, re-insert at e+1, read and update at e+3;
+//     a second key: delete at e, re-insert at e+3
+//   9 cross-epoch chain: delete e, insert e+1, delete e+2, insert e+3, read e+4
+struct PlantedOp { epic::ycsb::YcsbOpType op; uint32_t key; };
+
+void plantAdversarialDeletes(std::vector<epic::TxnArray<epic::ycsb::YcsbTxn>>& txn_array,
+                             const epic::ycsb::YcsbConfig& config, uint64_t base_seed,
+                             const std::vector<uint32_t>& epoch_tail, const std::vector<uint32_t>& epoch_head,
+                             uint32_t global_head)
+{
+    using epic::ycsb::YcsbOpType;
+    using epic::ycsb::YcsbTxn;
+    auto& logger = epic::Logger::GetInstance();
+    std::mt19937 gen(static_cast<uint32_t>(base_seed ^ 0x5eed5eedULL));
+    std::uniform_int_distribution<> field_gen(0, 9);
+    const uint32_t epochs = static_cast<uint32_t>(config.epochs);
+    const uint32_t num_txns = static_cast<uint32_t>(config.num_txns);
+    const uint32_t ops = static_cast<uint32_t>(config.num_ops_per_txn);
+    constexpr uint32_t kStride = 50, kBlock = 4;
+    uint32_t fresh_next = global_head;                       // above every churn key
+    uint32_t never_next = static_cast<uint32_t>(config.num_records) + 1000u;
+    std::unordered_set<uint32_t> planted;
+    uint64_t instances = 0;
+
+    auto window_key = [&](uint32_t e) -> uint32_t {
+        // live throughout epoch e and the following four: above 60 % of the
+        // window at epoch e's start, below the keys epoch e inserts.
+        const uint32_t tail = epoch_tail[e];
+        const uint32_t head = (e == 0) ? static_cast<uint32_t>(config.starting_num_records) : epoch_head[e - 1];
+        const uint32_t lo = tail + static_cast<uint32_t>((head - tail) * 0.6);
+        std::uniform_int_distribution<uint32_t> pick(lo, head - 1);
+        for (int tries = 0; tries < 64; ++tries) {
+            uint32_t k = pick(gen);
+            if (planted.insert(k).second) return k;
+        }
+        throw std::runtime_error("ycsbx: could not pick an unused live key");
+    };
+    auto pad_key = [&](uint32_t e, const std::vector<PlantedOp>& used, const YcsbTxn* txn, uint32_t filled) -> uint32_t {
+        const uint32_t tail = epoch_tail[e];
+        const uint32_t head = (e == 0) ? static_cast<uint32_t>(config.starting_num_records) : epoch_head[e - 1];
+        std::uniform_int_distribution<uint32_t> pick(tail + (head - tail) / 2, head - 1);
+        for (;;) {
+            uint32_t k = pick(gen);
+            bool clash = planted.count(k) != 0;
+            for (const auto& u : used) clash = clash || u.key == k;
+            for (uint32_t j = 0; j < filled && !clash; ++j) clash = txn->keys[j] == k;
+            if (!clash) return k;
+        }
+    };
+    auto set_txn = [&](uint32_t e, uint32_t t, const std::vector<PlantedOp>& planted_ops) {
+        if (e >= epochs || t >= num_txns) return;
+        YcsbTxn* txn = reinterpret_cast<YcsbTxn*>(txn_array[e].getTxn(t)->data);
+        uint32_t i = 0;
+        for (; i < planted_ops.size() && i < ops; ++i) {
+            txn->ops[i] = planted_ops[i].op;
+            txn->keys[i] = planted_ops[i].key;
+            txn->fields[i] = field_gen(gen);
+        }
+        for (; i < ops; ++i) {
+            txn->ops[i] = YcsbOpType::READ;
+            txn->keys[i] = pad_key(e, planted_ops, txn, i);
+            txn->fields[i] = field_gen(gen);
+        }
+    };
+    const auto R = YcsbOpType::READ, U = YcsbOpType::UPDATE, I = YcsbOpType::INSERT, D = YcsbOpType::DELETE;
+    for (uint32_t e = 0; e < epochs; ++e) {
+        for (uint32_t b = 0; (b * kStride) + kBlock <= num_txns; ++b) {
+            const uint32_t t0 = b * kStride;
+            const uint32_t pattern = b % 10;
+            if (pattern >= 8 && (e % 5) != 0) continue;
+            switch (pattern) {
+            case 0: { uint32_t k = window_key(e);
+                set_txn(e, t0, {{R, k}}); set_txn(e, t0 + 1, {{D, k}}); set_txn(e, t0 + 2, {{R, k}, {U, k}});
+                set_txn(e, t0 + 3, {{R, k}}); break; }
+            case 1: { uint32_t k = window_key(e);
+                set_txn(e, t0, {{D, k}}); set_txn(e, t0 + 1, {{I, k}}); set_txn(e, t0 + 2, {{R, k}, {U, k}});
+                set_txn(e, t0 + 3, {{R, k}}); break; }
+            case 2: { uint32_t k = window_key(e);
+                set_txn(e, t0, {{R, k}, {D, k}, {R, k}, {I, k}, {R, k}, {U, k}}); set_txn(e, t0 + 1, {{R, k}}); break; }
+            case 3: { uint32_t f = fresh_next++;
+                set_txn(e, t0, {{I, f}}); set_txn(e, t0 + 1, {{R, f}, {U, f}}); set_txn(e, t0 + 2, {{D, f}});
+                set_txn(e, t0 + 3, {{R, f}}); break; }
+            case 4: { uint32_t f = fresh_next++;
+                set_txn(e, t0, {{R, f}}); set_txn(e, t0 + 1, {{I, f}}); set_txn(e, t0 + 2, {{R, f}}); break; }
+            case 5: { uint32_t k = window_key(e);
+                set_txn(e, t0, {{I, k}}); set_txn(e, t0 + 1, {{R, k}, {U, k}}); break; }
+            case 6: { uint32_t k = window_key(e); uint32_t n = never_next++;
+                set_txn(e, t0, {{D, k}}); set_txn(e, t0 + 1, {{D, k}, {R, n}, {U, n}, {D, n}});
+                set_txn(e, t0 + 2, {{I, k}, {R, k}}); set_txn(e, t0 + 3, {{D, k}}); break; }
+            case 7: { uint32_t k = window_key(e);
+                set_txn(e, t0, {{D, k}, {I, k}, {D, k}, {I, k}, {R, k}}); set_txn(e, t0 + 1, {{R, k}}); break; }
+            case 8: { uint32_t k = window_key(e); uint32_t k2 = window_key(e);
+                set_txn(e, t0, {{D, k}}); set_txn(e + 1, t0, {{I, k}}); set_txn(e + 1, t0 + 1, {{R, k}, {U, k}});
+                set_txn(e + 3, t0, {{R, k}, {U, k}});
+                set_txn(e, t0 + 2, {{D, k2}}); set_txn(e + 3, t0 + 2, {{I, k2}, {R, k2}}); break; }
+            case 9: { uint32_t k = window_key(e);
+                set_txn(e, t0, {{D, k}}); set_txn(e + 1, t0, {{I, k}}); set_txn(e + 2, t0, {{D, k}});
+                set_txn(e + 3, t0, {{I, k}, {R, k}}); set_txn(e + 4, t0, {{R, k}, {U, k}}); break; }
+            default: break;
+            }
+            ++instances;
+        }
+    }
+    logger.Info("ycsbx: planted {} pattern instances over {} epochs ({} fresh keys, {} never-inserted keys)",
+                instances, epochs, fresh_next - global_head, never_next - (static_cast<uint32_t>(config.num_records) + 1000u));
+}
+
+} // namespace
 
 namespace {
     template <typename VariantPtr>
@@ -282,19 +413,22 @@ void YcsbBenchmark::generateTxns()
     std::uniform_int_distribution<uint32_t> recent_offset_gen(
         0, recent_window > 0 ? recent_window - 1 : 0);
 
-    // Sliding-window generation for delete-bearing mixes (ycsbw). A
-    // separate branch so mixes without deletes keep the loop below
-    // bit-identical (its RNG stream backs the recovery anchors). Inserts
-    // mint keys at the head of the key space; each delete consumes the
-    // oldest live key from the tail; reads and updates draw from the live
-    // window [tail, head) only. Two passes per transaction: pass 1 fixes
-    // op types and the head/tail keys, so pass 2's window draws can never
-    // land on a key this transaction inserts or deletes, which keeps
-    // every delete terminal (no operation ordered after a delete ever
-    // touches its key, in this epoch or any later one).
+    // Sliding-window generation for delete-bearing mixes (ycsbw, and the
+    // base of ycsbx). A separate branch so mixes without deletes keep the
+    // loop below bit-identical (its RNG stream backs the recovery anchors).
+    // Inserts mint keys at the head of the key space; each delete consumes
+    // the oldest live key from the tail; reads and updates draw from the
+    // live window [tail, head) only. Two passes per transaction: pass 1
+    // fixes op types and the head/tail keys, so pass 2's window draws can
+    // never land on a key this transaction inserts or deletes. In ycsbw no
+    // operation therefore touches a key after its delete; that is a
+    // property of the workload, not a requirement of the index, which
+    // resolves every operation against the serial order of the epoch's
+    // inserts and deletes (ycsbx exercises the other orders).
     if (config.txn_mix.num_deletes > 0)
     {
         uint32_t delete_tail = 0;
+        std::vector<uint32_t> epoch_tail, epoch_head;   // window bounds at the end of each epoch
         for (size_t epoch = 0; epoch < config.epochs; ++epoch)
         {
             logger.Info("Generating epoch {}", epoch);
@@ -349,6 +483,12 @@ void YcsbBenchmark::generateTxns()
                     txn->fields[op] = field_gen(gen);
                 }
             }
+            epoch_tail.push_back(delete_tail);
+            epoch_head.push_back(max_existing_record);
+        }
+        if (config.adversarial_deletes)
+        {
+            plantAdversarialDeletes(txn_array, config, base_seed, epoch_tail, epoch_head, max_existing_record);
         }
         return;
     }
@@ -458,6 +598,14 @@ void YcsbBenchmark::runEpoch(uint32_t epoch_id, FlushHandle& flush_inflight)
         start_time = std::chrono::high_resolution_clock::now();
         uint32_t index_epoch_id = epoch_id - 1;
         index->indexTxns(index_input, index_output, index_epoch_id);
+        // The submitter needs this epoch's minted CRID range to tell an
+        // INSERT that creates its record from one that writes an existing one.
+        if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) {
+            submitter->setMintedRange(gi->mintedBegin(), gi->numMintedThisEpoch());
+        }
+#ifdef EGAD_VALIDATION
+        oracleCheckEpoch(epoch_id);
+#endif
         end_time = std::chrono::high_resolution_clock::now();
         logger.Info("Epoch {} indexing time: {} us", epoch_id,
             std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count());
@@ -715,6 +863,15 @@ void YcsbBenchmark::runBenchmark()
             start_epoch = E - 1;
         }
     }
+#ifdef EGAD_VALIDATION
+    if (std::getenv("EPIC_TIMELINE_ORACLE") != nullptr && config.execution_mode == ExecMode::HYBRID_STAGING) {
+        oracle_ = std::make_unique<YcsbTimelineOracle>(config);
+        oracle_params_host_.resize(BaseTxnSize<YcsbTxnParam>::value * config.num_txns);
+        // A recovering process resumes at E-1: bring the model to end-of-(E-2).
+        for (uint32_t e = 1; e < start_epoch; ++e) oracle_->replayEpoch(e, txn_array[e - 1], nullptr);
+        logger.Info("[TIMELINE-ORACLE] active from epoch {}", start_epoch);
+    }
+#endif
 
     for (uint32_t epoch_id = start_epoch; epoch_id <= config.epochs; ++epoch_id)
     {
@@ -800,9 +957,38 @@ void YcsbBenchmark::runBenchmark()
         Logger::GetInstance().Info("[STATE-HASH-LIVE] ycsb live-mapping = 0x{:016x}",
                                    cpu_shadow_->liveDigestFromLogs(currentInsertCount(), currentDeleteCount()));
     }
+    oracleFinalCheck();
 #endif // EGAD_VALIDATION
     verifyInsertedRecords();
 }
+
+#ifdef EGAD_VALIDATION
+void YcsbBenchmark::oracleCheckEpoch(uint32_t epoch_id)
+{
+    if (!oracle_) return;
+    transferGpuToCpu(oracle_params_host_.data(), index_output.txns, oracle_params_host_.size());
+    oracle_->replayEpoch(epoch_id, txn_array[epoch_id - 1], oracle_params_host_.data());
+}
+
+void YcsbBenchmark::oracleFinalCheck()
+{
+    if (!oracle_) return;
+    auto& logger = Logger::GetInstance();
+    std::vector<uint32_t> keys, expected;
+    keys.reserve(oracle_->live().size()); expected.reserve(oracle_->live().size());
+    for (const auto& kv : oracle_->live()) { keys.push_back(kv.first); expected.push_back(kv.second); }
+    uint32_t violations = 0;
+    if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) {
+        violations = gi->verifyLiveMapping(keys, expected, oracle_->deadSample(200000));
+    }
+    const bool pass = oracle_->totalMismatches() == 0 && violations == 0;
+    logger.Info("[TIMELINE-ORACLE] {} mismatches={} map_violations={} absent_ops={} minted={} effective_deletes={} "
+                "reinserts={} write_inserts={} live={}",
+                pass ? "PASS" : "FAILED", oracle_->totalMismatches(), violations, oracle_->totalAbsentOps(),
+                oracle_->totalMinted(), oracle_->totalEffectiveDeletes(), oracle_->totalReinserts(),
+                oracle_->totalWriteInserts(), oracle_->live().size());
+}
+#endif // EGAD_VALIDATION
 
 
 // GPU planner + submitter construction, factored out of the ctor.

@@ -6,6 +6,7 @@
 #define EPIC_BENCHMARKS_YCSB_GPU_INDEX_H
 
 #include <any>
+#include <vector>
 
 #include <benchmarks/ycsb_config.h>
 #include <benchmarks/ycsb_cpu_shadow_index.h>
@@ -50,6 +51,22 @@ public:
     // without deletes.
     const uint32_t* deleteCridsDevice() const;
     uint32_t numDeletesThisEpoch() const;
+
+    // The records minted this epoch occupy the CRID range
+    // [mintedBegin(), mintedBegin() + numMintedThisEpoch()). An INSERT op
+    // whose record id lies in it creates the record (the stager allocates
+    // its cache slot without a Primary Store fetch); an INSERT op resolving
+    // outside it writes an existing record.
+    uint32_t mintedBegin() const;
+    uint32_t numMintedThisEpoch() const;
+
+#ifdef EGAD_VALIDATION
+    // Map check: every (key, expected CRID) pair must be found in the GPU
+    // index with that CRID and none of the dead keys may be found. Logs one
+    // [MAP-CHECK] line; returns the number of violations.
+    uint32_t verifyLiveMapping(const std::vector<uint32_t>& keys, const std::vector<uint32_t>& expected,
+                               const std::vector<uint32_t>& dead) const;
+#endif
 };
 
 } // namespace epic::ycsb

@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <utility>
 
 #include <benchmarks/tpcc_config.h>
 #include <benchmarks/tpcc_table.h>
@@ -122,14 +123,16 @@ public:
     void reconstructInsertsFromDurable(TpccFreeStarts f);
 
     // Per-epoch NewOrder delete mirror, the dual of mirrorEpoch's insert
-    // append. Appends this epoch's delivered NO keys (already D2H'd into
-    // h_no_delete_keys()) to the durable delete log at
-    // [old_delete_count, old_delete_count+n).
+    // append. Appends this epoch's effective deletes, the delivered NO
+    // keys (h_no_delete_keys()) and the CRIDs they end (h_no_delete_crids()),
+    // to the durable delete log at [old_delete_count, old_delete_count+n).
     void mirrorEpochNoDeletes(uint32_t num_deletes, uint32_t old_delete_count);
 
     // Recover-mode: apply the first `count` durable NO delete-log entries
-    // to the NewOrder shadow (sentinel each key's dense slot). Runs after
-    // reconstructInsertsFromDurable; deletes are terminal (a delivered
+    // to the NewOrder shadow: a delete sentinels its key's dense slot only
+    // while the slot still holds the CRID the delete ended, so a later life
+    // of the same key survives. Runs after reconstructInsertsFromDurable
+    // (whose later entry replaces an earlier one; a delivered
     // (w,d,o) never recurs), so the two passes need no interleaving.
     void applyNoDeletesFromDurable(uint32_t count);
 
@@ -147,6 +150,11 @@ public:
     // replay of the logs at the rollback cursors. Logs [LIVE-CHECK] PASS
     // or FAILED; does not throw.
     void verifyNoLiveAgainstLogs(uint32_t ins_count, uint32_t del_count) const;
+
+    // The live NewOrder mapping implied by the logs, as (packed key, CRID)
+    // pairs, for the end-of-run map check against the GPU index.
+    std::vector<std::pair<NewOrderKey::baseType, uint32_t>> noLiveStateFromLogs(uint32_t ins_count,
+                                                                               uint32_t del_count) const;
 #endif // EGAD_VALIDATION
 
     // Read-only access to the underlying vectors. Used by the GPU index
@@ -172,6 +180,8 @@ public:
     OrderKey::baseType*     h_o_keys()  { return h_o_keys_;  }
     OrderLineKey::baseType* h_ol_keys() { return h_ol_keys_; }
     NewOrderKey::baseType*  h_no_delete_keys() { return h_no_delete_keys_; }
+    NewOrderKey::baseType   durableNoDeleteKey(uint32_t j) const { return durable_no_delete_keys_[j]; }
+    uint32_t*               h_no_delete_crids() { return h_no_delete_crids_; }
 
 private:
     TpccConfig tpcc_config_;
@@ -208,15 +218,19 @@ private:
     OrderKey::baseType*     durable_o_keys_  = nullptr;
     OrderLineKey::baseType* durable_ol_keys_ = nullptr;
 
-    // Pinned host buffer for per-epoch D2H of delivered (deleted) NO keys.
-    // Allocated only for Delivery-bearing mixes.
+    // Pinned host buffers for per-epoch D2H of the effective NO deletes:
+    // the delivered keys and the CRIDs their deletes end. Allocated only
+    // for Delivery-bearing mixes.
     NewOrderKey::baseType*  h_no_delete_keys_ = nullptr;
+    uint32_t*               h_no_delete_crids_ = nullptr;
 
-    // Durable append-only array of deleted NO keys, indexed by cumulative
-    // delete count; the insert log's dual. Each NO row is delivered at
-    // most once, so the log is bounded by the NO key universe. null when
+    // Durable append-only arrays of the effective NO deletes, indexed by
+    // cumulative delete count: the key and the CRID the delete ended; the
+    // insert log's dual. Every delete ends one CRID and CRIDs are never
+    // reused, so the log is bounded by the NO record universe. null when
     // not in durable mode or the mix has no Delivery.
     NewOrderKey::baseType*  durable_no_delete_keys_ = nullptr;
+    uint32_t*               durable_no_delete_crids_ = nullptr;
 };
 
 } // namespace epic::tpcc

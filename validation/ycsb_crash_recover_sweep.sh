@@ -16,12 +16,13 @@
 #   GPU=2 WL=ycsbf CES="10" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh
 #   GPU=2 WL=ycsbw CES="5" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh
 #   GPU=2 WL=ycsbi CES="2 5 7" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh
+#   GPU=2 WL=ycsbx CES="3 4 6 8" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh
 #   GPU=2 WL=ycsbf CES="2 10 19" CPS="0 1 2 3 4 5" bash ycsb_crash_recover_sweep.sh  # full
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BIN=${BIN:-EGAD/build/epic_driver}
 GPU=${GPU:-2}
-WL=${WL:-ycsbf}              # ycsbf (no inserts) | ycsbi (inserts) | ycsbw (inserts + deletes)
+WL=${WL:-ycsbf}              # ycsbf (no inserts) | ycsbi (inserts) | ycsbw (inserts + deletes) | ycsbx (adversarial deletes)
 SEED=${SEED:-42}
 Z=${Z:-true}
 BASELINE=${BASELINE:-}
@@ -40,6 +41,12 @@ elif [ "$WL" = "ycsbw" ]; then
     EPOCHS=${EPOCHS:-10}
     ARGS=(-b ycsbw -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
           -n 8000000 -N 1000000 -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
+elif [ "$WL" = "ycsbx" ]; then
+    # Adversarial delete semantics: 12 epochs so the cross-epoch re-insert
+    # patterns complete; the crash epochs should straddle them.
+    EPOCHS=${EPOCHS:-12}
+    ARGS=(-b ycsbx -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
+          -n 8000000 -N 1000000 -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
 else
     EPOCHS=${EPOCHS:-20}
     ARGS=(-b ycsbf -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
@@ -50,6 +57,16 @@ NUMA=(numactl --physcpubind=12-23,36-47 --membind=1)
 BASEENV=(EPIC_WORKLOAD_AWARE_AUTOSIZER=1
          OMP_DYNAMIC=false
          CUDA_VISIBLE_DEVICES=$GPU EPIC_YCSB_SEED=$SEED)
+# The delete workloads are sized so the autosized cache would hold the whole
+# table; cap it so eviction and the reclaim-first pass run in every cell.
+if [ "$WL" = "ycsbw" ] || [ "$WL" = "ycsbx" ]; then
+    BASEENV+=(EPIC_YCSB_CACHE_CAP=${CAP:-1500000})
+fi
+# Serial-order oracle (validation build): every epoch's resolved records are
+# compared with a host replay, and the index with the model's live set at the
+# end; a recovering process must agree as well. Gated below on
+# [TIMELINE-ORACLE] FAILED and [MAP-CHECK] FAILED.
+BASEENV+=(EPIC_TIMELINE_ORACLE=1)
 live () { grep -aoE 'STATE-HASH-LIVE.*0x[0-9a-f]+' "$1" | grep -oE '0x[0-9a-f]+' | tail -1; }
 valonly () { grep -aoE 'STATE-HASH-VALONLY.*0x[0-9a-f]+' "$1" | grep -oE '0x[0-9a-f]+' | tail -1; }
 # positional [STATE-HASH] (byte-exact). Recovery reproduces it byte-
@@ -97,6 +114,8 @@ for ce in $CES; do for cp in $CPS; do
     rvo=$(valonly "$rlog"); rpos=$(pos "$rlog")
     vfail=$(grep -aE '\[VERIFY\].*FAILED' "$rlog")
     lfail=$(grep -aE '\[LIVE-CHECK\] FAILED' "$rlog")
+    ofail=$(grep -aE '\[TIMELINE-ORACLE\] (FAILED|mismatch)|\[MAP-CHECK\] FAILED' "$rlog" "$wlog")
+    opass=$(grep -aE '\[TIMELINE-ORACLE\] PASS' "$rlog")
     rlv=$(live "$rlog")
     demoted=$(grep -aoE 'demoted [0-9]+ slots' "$rlog" | grep -oE '[0-9]+' | head -1)
     ok=1; why=""
@@ -104,6 +123,8 @@ for ce in $CES; do for cp in $CPS; do
     if [ -n "$BASEPOS" ]; then { [ "$rpos" = "$BASEPOS" ] && [ -n "$rpos" ]; } || { ok=0; why+=" POS(${rpos:-none}!=$BASEPOS)"; }; fi
     [ -n "$vfail" ] && { ok=0; why+=" [VERIFY]FAILED"; }
     [ -n "$lfail" ] && { ok=0; why+=" [LIVE-CHECK]FAILED"; }
+    [ -n "$ofail" ] && { ok=0; why+=" [TIMELINE-ORACLE/MAP-CHECK]FAILED"; }
+    [ -z "$opass" ] && { ok=0; why+=" [TIMELINE-ORACLE]missing"; }
     if [ -n "$BASELIVE" ]; then { [ "$rlv" = "$BASELIVE" ]; } || { ok=0; why+=" LIVE(${rlv:-none}!=$BASELIVE)"; }; fi
     if [ "$ok" = 1 ]; then
         echo "  PASS  crash@e${ce} p${cp}  worker_rc=$wrc recover_rc=$rrc demoted=${demoted:-?}  VALONLY=$rvo POS=$rpos"
@@ -114,12 +135,12 @@ for ce in $CES; do for cp in $CPS; do
     fi
     rm -rf "$DIR"
 done; done
-# ycsbw only: drop-one-delete negative control. Re-run one crash cell but
-# recover with EPIC_RECOVERY_DROP_ONE_DELETE=1, which suppresses one delete
-# during shadow reconstruction. A wrongly revived key changes no record
-# bytes, so the byte gates alone cannot see it; the [LIVE-CHECK]
+# Delete workloads: drop-one-delete negative control. Re-run one crash cell
+# but recover with EPIC_RECOVERY_DROP_ONE_DELETE=1, which suppresses one
+# delete during shadow reconstruction. A wrongly revived key changes no
+# record bytes, so the byte gates alone cannot see it; the [LIVE-CHECK]
 # shadow-vs-log pass must catch it. SENSITIVE = it did.
-if [ "$WL" = "ycsbw" ]; then
+if [ "$WL" = "ycsbw" ] || [ "$WL" = "ycsbx" ]; then
     nce=$(echo $CES | awk '{print $1}')
     rm -rf "$DIR"; mkdir -p "$DIR"
     nwlog=/tmp/ycr_negw_${WL}_e${nce}.log; nrlog=/tmp/ycr_negr_${WL}_e${nce}.log

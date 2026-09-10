@@ -49,16 +49,19 @@ YcsbCpuShadowIndex::YcsbCpuShadowIndex(YcsbConfig config)
             MallocDurable("ycsb_shadow_keys", headroom * sizeof(uint32_t)));
     }
 
-    // Delete-log allocations, only for delete-bearing mixes. A key is
-    // deleted at most once (deletes are terminal), so the durable log's
-    // bound is the total key universe.
+    // Delete-log allocations, only for delete-bearing mixes. Every
+    // effective delete ends one CRID and CRIDs are never reused, so the
+    // durable log's bound is the record universe.
     if (ycsb_config_.txn_mix.num_deletes > 0) {
-        h_delete_keys_ = static_cast<uint32_t*>(
-            Malloc(static_cast<size_t>(ycsb_config_.num_txns) *
-                   ycsb_config_.num_ops_per_txn * sizeof(uint32_t)));
+        const size_t per_epoch = static_cast<size_t>(ycsb_config_.num_txns) * ycsb_config_.num_ops_per_txn;
+        h_delete_keys_ = static_cast<uint32_t*>(Malloc(per_epoch * sizeof(uint32_t)));
+        h_delete_crids_ = static_cast<uint32_t*>(Malloc(per_epoch * sizeof(uint32_t)));
         if (durable) {
             durable_delete_keys_ = static_cast<uint32_t*>(
                 MallocDurable("ycsb_shadow_del_keys",
+                              static_cast<size_t>(ycsb_config_.num_records) * sizeof(uint32_t)));
+            durable_delete_crids_ = static_cast<uint32_t*>(
+                MallocDurable("ycsb_shadow_del_crids",
                               static_cast<size_t>(ycsb_config_.num_records) * sizeof(uint32_t)));
         }
     }
@@ -73,6 +76,10 @@ YcsbCpuShadowIndex::~YcsbCpuShadowIndex()
     if (h_delete_keys_) {
         Free(h_delete_keys_);
         h_delete_keys_ = nullptr;
+    }
+    if (h_delete_crids_) {
+        Free(h_delete_crids_);
+        h_delete_crids_ = nullptr;
     }
 }
 
@@ -131,7 +138,8 @@ void YcsbCpuShadowIndex::mirrorEpoch(uint32_t num_inserts, uint32_t old_free_sta
 }
 
 // See header. Mirror of mirrorEpoch's CRID allocation: the
-// j-th durable insert key maps to CRID starting+j. OMP per-shard (no cross-
+// j-th durable insert key maps to CRID starting+j, and a later entry for
+// the same key replaces the earlier mapping. OMP per-shard (no cross-
 // shard contention). Used by recover-mode before rebuildCucoFromShadow.
 void YcsbCpuShadowIndex::reconstructInsertsFromDurable(uint32_t count)
 {
@@ -144,7 +152,7 @@ void YcsbCpuShadowIndex::reconstructInsertsFromDurable(uint32_t count)
         for (uint32_t j = 0; j < count; ++j) {
             uint32_t key = durable_insert_keys_[j];
             if (shardForKey(key) == static_cast<uint32_t>(tid)) {
-                shard.try_emplace(key, starting + j);
+                shard[key] = starting + j;
             }
         }
     }
@@ -164,11 +172,14 @@ void YcsbCpuShadowIndex::mirrorEpochDeletes(uint32_t num_deletes, uint32_t old_d
     if (durable_delete_keys_) {
         std::memcpy(durable_delete_keys_ + old_delete_count, h_delete_keys_,
                     static_cast<size_t>(num_deletes) * sizeof(uint32_t));
+        std::memcpy(durable_delete_crids_ + old_delete_count, h_delete_crids_,
+                    static_cast<size_t>(num_deletes) * sizeof(uint32_t));
     }
 }
 
 // See header. OMP per-shard like reconstructInsertsFromDurable: each
-// thread erases the log's keys that hash to its shard.
+// thread applies the log's entries whose key hashes to its shard, erasing
+// the key only while it still maps to the CRID the delete ended.
 void YcsbCpuShadowIndex::applyDeletesFromDurable(uint32_t count)
 {
     if (!durable_delete_keys_ || count == 0) return;
@@ -193,7 +204,10 @@ void YcsbCpuShadowIndex::applyDeletesFromDurable(uint32_t count)
         for (uint32_t j = first; j < count; ++j) {
             uint32_t key = durable_delete_keys_[j];
             if (shardForKey(key) == static_cast<uint32_t>(tid)) {
-                shard.erase(key);
+                auto it = shard.find(key);
+                if (it != shard.end() && it->second == durable_delete_crids_[j]) {
+                    shard.erase(it);
+                }
             }
         }
     }
@@ -213,27 +227,25 @@ inline uint64_t foldLiveEntry(uint32_t key, uint32_t crid)
 }
 } // namespace
 
+// Straight-line replay of the logs into a scratch map, deliberately
+// independent of loadInitialData / reconstructInsertsFromDurable /
+// applyDeletesFromDurable so it can catch bugs in any of them.
 uint64_t YcsbCpuShadowIndex::liveDigestFromLogs(uint32_t ins_count, uint32_t del_count) const
 {
     if (del_count > 0 && !durable_delete_keys_) return 0;
     if (ins_count > 0 && !durable_insert_keys_) return 0;
 
-    ankerl::unordered_dense::set<uint32_t> deleted;
-    deleted.reserve(del_count);
-    for (uint32_t j = 0; j < del_count; ++j) {
-        deleted.insert(durable_delete_keys_[j]);
-    }
-
     const uint32_t starting = static_cast<uint32_t>(ycsb_config_.starting_num_records);
+    ankerl::unordered_dense::map<uint32_t, uint32_t> state;
+    state.reserve(static_cast<size_t>(starting) + ins_count);
+    for (uint32_t k = 0; k < starting; ++k) state.emplace(k, k);
+    for (uint32_t j = 0; j < ins_count; ++j) state[durable_insert_keys_[j]] = starting + j;
+    for (uint32_t j = 0; j < del_count; ++j) {
+        auto it = state.find(durable_delete_keys_[j]);
+        if (it != state.end() && it->second == durable_delete_crids_[j]) state.erase(it);
+    }
     uint64_t acc = 0;
-    #pragma omp parallel for reduction(+:acc) schedule(static)
-    for (uint32_t k = 0; k < starting; ++k) {
-        if (!deleted.contains(k)) acc += foldLiveEntry(k, k);
-    }
-    for (uint32_t j = 0; j < ins_count; ++j) {
-        const uint32_t key = durable_insert_keys_[j];
-        if (!deleted.contains(key)) acc += foldLiveEntry(key, starting + j);
-    }
+    for (const auto& kv : state) acc += foldLiveEntry(kv.first, kv.second);
     return acc;
 }
 

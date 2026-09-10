@@ -6,6 +6,8 @@
 #define EPIC_BENCHMARKS_TPCC_GPU_INDEX_H
 
 #include <any>
+#include <vector>
+#include <utility>
 
 #include <benchmarks/tpcc_cpu_shadow_index.h>  // TpccFreeStarts + TpccCpuShadowIndex
 #include <benchmarks/tpcc_index.h>
@@ -54,6 +56,15 @@ public:
     // reclaim-first. Count is 0 on mixes without Delivery.
     const uint32_t* noDeleteCridsDevice() const;
     uint32_t numNoDeletesThisEpoch() const;
+
+#ifdef EGAD_VALIDATION
+    // Map check: every (key, CRID) pair must be found in the GPU NewOrder
+    // index with that CRID, and the index must hold exactly that many keys
+    // among the probed dead keys (none). Logs one [MAP-CHECK] line; returns
+    // the number of violations.
+    uint32_t verifyNoLiveMapping(const std::vector<std::pair<NewOrderKey::baseType, uint32_t>>& live,
+                                 const std::vector<NewOrderKey::baseType>& dead) const;
+#endif
 };
 
 } // namespace epic::tpcc

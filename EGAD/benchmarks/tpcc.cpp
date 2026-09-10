@@ -1070,6 +1070,17 @@ void TpccDb::runBenchmark()
                 logger.Info("[STATE-HASH-LIVE] tpcc NO live-mapping = 0x{:016x}",
                             cpu_shadow_->noLiveDigestFromLogs(gi->getInsertCounts().new_order,
                                                               gi->getNoDeleteCount()));
+                // Map check: the GPU NewOrder index must agree with the live
+                // mapping the logs imply; the delivered keys (the delete
+                // log's prefix) must be absent.
+                {
+                    const uint32_t ins = gi->getInsertCounts().new_order, del = gi->getNoDeleteCount();
+                    auto live = cpu_shadow_->noLiveStateFromLogs(ins, del);
+                    std::vector<NewOrderKey::baseType> dead;
+                    dead.reserve(std::min<uint32_t>(del, 200000u));
+                    for (uint32_t j = 0; j < del && dead.size() < 200000u; ++j) dead.push_back(cpu_shadow_->durableNoDeleteKey(j));
+                    gi->verifyNoLiveMapping(live, dead);
+                }
             }
         }
     }

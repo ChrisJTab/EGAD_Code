@@ -78,28 +78,35 @@ public:
     // Recover-mode: rebuild the insert shards from the durable
     // insert-keys array (mmap'd, survives the crash) for CRIDs [starting,
     // starting+count). The j-th durable key maps to CRID starting+j, matching
-    // mirrorEpoch's allocation. Used in a fresh process before rebuildCucoFromShadow.
+    // mirrorEpoch's allocation, and a later entry for the same key replaces
+    // the earlier mapping (a key re-inserted after a delete gets its latest
+    // life). Used in a fresh process before rebuildCucoFromShadow.
     void reconstructInsertsFromDurable(uint32_t count);
 
     // Per-epoch delete mirror, the dual of mirrorEpoch. Appends this
-    // epoch's delete keys (already D2H'd into h_delete_keys()) to the
-    // durable delete log at [old_delete_count, old_delete_count+n).
+    // epoch's effective deletes, the keys (h_delete_keys()) and the CRIDs
+    // they end (h_delete_crids()), to the durable delete log at
+    // [old_delete_count, old_delete_count+n).
     void mirrorEpochDeletes(uint32_t num_deletes, uint32_t old_delete_count);
 
     // Recover-mode: apply the first `count` durable delete-log entries to
-    // the shards (erase each key). Runs after reconstructInsertsFromDurable,
-    // so a key inserted and later deleted (both at or before the rollback
-    // cursor) ends absent. Deletes are terminal (no key is re-inserted), so
-    // the two passes need no interleaving by epoch.
+    // the shards. Runs after reconstructInsertsFromDurable. A delete entry
+    // erases its key only while the key still maps to the CRID the delete
+    // ended, so the two passes need no interleaving by epoch: every life of
+    // a key has its own CRID, a later life of the same key (a re-insert in
+    // a later epoch, or later in the same epoch) survives the delete of an
+    // earlier one, and a born-dead life is erased by its own delete.
     void applyDeletesFromDurable(uint32_t count);
 
 #ifdef EGAD_VALIDATION
     // Order-independent digest of the live key->CRID mapping derived from
-    // the durable logs alone (initial population + first ins_count insert
-    // entries minus first del_count delete entries). The recovery liveness
-    // gate: byte hashes of the Primary Store cannot see a wrongly revived
-    // key because a delete writes no record bytes, so the gate digests the
-    // mapping instead. 0 when not in durable mode.
+    // the durable logs alone (initial population, then the first ins_count
+    // insert entries applied in order with a later entry replacing an
+    // earlier one, then the first del_count delete entries each erasing its
+    // key only while the key maps to the CRID it ended). The recovery
+    // liveness gate: byte hashes of the Primary Store cannot see a wrongly
+    // revived key because a delete writes no record bytes, so the gate
+    // digests the mapping instead. 0 when not in durable mode.
     uint64_t liveDigestFromLogs(uint32_t ins_count, uint32_t del_count) const;
 
     // Recover-time self-consistency check: the same digest computed over
@@ -120,6 +127,7 @@ public:
     // the D2H into these buffers and then calls the mirror.
     uint32_t* h_insert_keys() { return h_insert_keys_; }
     uint32_t* h_delete_keys() { return h_delete_keys_; }
+    uint32_t* h_delete_crids() { return h_delete_crids_; }
 
     // Static accessors so external callers (the GPU index) can use the
     // same shard count and a matching shard() lookup helper.
@@ -137,9 +145,10 @@ private:
     // Pinned host buffer for per-epoch D2H of insert keys.
     uint32_t* h_insert_keys_ = nullptr;
 
-    // Pinned host buffer for per-epoch D2H of delete keys. Allocated only
-    // for delete-bearing mixes.
+    // Pinned host buffers for per-epoch D2H of the effective deletes' keys
+    // and the CRIDs they end. Allocated only for delete-bearing mixes.
     uint32_t* h_delete_keys_ = nullptr;
+    uint32_t* h_delete_crids_ = nullptr;
 
     // Durable (mmap-backed when EPIC_DURABLE_STORE/RECOVER_FROM)
     // append-only array of insert keys, indexed by (CRID - starting_num_records).
@@ -147,11 +156,13 @@ private:
     // when not in durable mode (normal/throughput path -> no allocation/overhead).
     uint32_t* durable_insert_keys_ = nullptr;
 
-    // Durable append-only array of delete keys, indexed by cumulative
-    // delete count; the dual of durable_insert_keys_. A key is deleted at
-    // most once (deletes are terminal), so the log is bounded by the total
-    // key universe. null when not in durable mode or the mix has no deletes.
+    // Durable append-only arrays of the effective deletes, indexed by
+    // cumulative delete count: the key and the CRID the delete ended; the
+    // dual of durable_insert_keys_. Every delete ends one CRID and CRIDs are
+    // never reused, so the log is bounded by the record universe. null when
+    // not in durable mode or the mix has no deletes.
     uint32_t* durable_delete_keys_ = nullptr;
+    uint32_t* durable_delete_crids_ = nullptr;
 };
 
 } // namespace epic::ycsb
