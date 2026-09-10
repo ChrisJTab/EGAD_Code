@@ -34,12 +34,14 @@ echo "----------------------------------------------------------------------"
 run /tmp/sem_ycsbx.log -- "${ARGSX[@]}"
 final=$(grep -aoE '\[TIMELINE-ORACLE\] (PASS|FAILED).*' /tmp/sem_ycsbx.log | tail -1)
 mapline=$(grep -aoE '\[MAP-CHECK\] (PASS|FAILED).*' /tmp/sem_ycsbx.log | tail -1)
+deadline=$(grep -aoE '\[DEAD-CHECK\] (PASS|FAILED).*' /tmp/sem_ycsbx.log | tail -1)
 absent=$(echo "$final" | grep -oE 'absent_ops=[0-9]+' | grep -oE '[0-9]+')
 reins=$(echo "$final" | grep -oE 'reinserts=[0-9]+' | grep -oE '[0-9]+')
 wins=$(echo "$final" | grep -oE 'write_inserts=[0-9]+' | grep -oE '[0-9]+')
 echo "[ycsbx] $final"
 echo "[ycsbx] $mapline"
-if echo "$final" | grep -q 'PASS' && echo "$mapline" | grep -q 'PASS' \
+echo "[ycsbx] $deadline"
+if echo "$final" | grep -q 'PASS' && echo "$mapline" | grep -q 'PASS' && echo "$deadline" | grep -q 'PASS' \
    && [ "${absent:-0}" -gt 0 ] && [ "${reins:-0}" -gt 0 ] && [ "${wins:-0}" -gt 0 ]; then
     echo "[ycsbx] serial-order semantics: PASS (coverage: absent=$absent reinserts=$reins write_inserts=$wins)"
 else

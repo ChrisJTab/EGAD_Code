@@ -114,7 +114,7 @@ for ce in $CES; do for cp in $CPS; do
     rvo=$(valonly "$rlog"); rpos=$(pos "$rlog")
     vfail=$(grep -aE '\[VERIFY\].*FAILED' "$rlog")
     lfail=$(grep -aE '\[LIVE-CHECK\] FAILED' "$rlog")
-    ofail=$(grep -aE '\[TIMELINE-ORACLE\] (FAILED|mismatch)|\[MAP-CHECK\] FAILED' "$rlog" "$wlog")
+    ofail=$(grep -aE '\[TIMELINE-ORACLE\] (FAILED|mismatch)|\[MAP-CHECK\] FAILED|\[DEAD-CHECK\] FAILED' "$rlog" "$wlog")
     opass=$(grep -aE '\[TIMELINE-ORACLE\] PASS' "$rlog")
     rlv=$(live "$rlog")
     demoted=$(grep -aoE 'demoted [0-9]+ slots' "$rlog" | grep -oE '[0-9]+' | head -1)

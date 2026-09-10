@@ -25,6 +25,7 @@ void YcsbTimelineOracle::reset()
     free_start_ = 0;
     live_.clear();
     dead_.clear();
+    ended_.clear();
     live_.reserve(config_.num_records);
     for (uint32_t k = 0; k < config_.starting_num_records; ++k) live_.emplace(k, k);
 }
@@ -61,6 +62,7 @@ uint32_t YcsbTimelineOracle::replayEpoch(uint32_t epoch_id, TxnArray<YcsbTxn>& i
             case YcsbOpType::DELETE:
                 if (it != live_.end()) {
                     expected = it->second;                        // the record the delete ends
+                    ended_.emplace_back(it->second, epoch_id);
                     live_.erase(it);
                     dead_.insert(key);
                     ++epoch_edel;

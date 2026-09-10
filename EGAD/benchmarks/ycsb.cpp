@@ -981,10 +981,33 @@ void YcsbBenchmark::oracleFinalCheck()
     if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) {
         violations = gi->verifyLiveMapping(keys, expected, oracle_->deadSample(200000));
     }
-    const bool pass = oracle_->totalMismatches() == 0 && violations == 0;
-    logger.Info("[TIMELINE-ORACLE] {} mismatches={} map_violations={} absent_ops={} minted={} effective_deletes={} "
+    // Dead-record check: a record whose life ended in epoch d may carry
+    // version tags up to d (its last modifications and the writeback of
+    // that epoch) but never a later one; a later tag means a write reached
+    // a deleted record. Whole-record layout only (the verifier's scope).
+    uint32_t late_writes = 0;
+    if (!config.split_field) {
+        auto* recs = std::get<YcsbRecords*>(CPU_records);
+        for (const auto& [crid, death] : oracle_->endedLives()) {
+            const uint32_t v1 = recs[crid].version1, v2 = recs[crid].version2;
+            if (v1 > death || v2 > death) {
+                if (late_writes < 10) {
+                    logger.Error("[DEAD-CHECK] record {} ended in epoch {} carries tags {} / {}", crid, death, v1, v2);
+                }
+                ++late_writes;
+            }
+        }
+        if (late_writes == 0) {
+            logger.Info("[DEAD-CHECK] PASS {} ended records carry no tag past their delete epoch", oracle_->endedLives().size());
+        } else {
+            logger.Error("[DEAD-CHECK] FAILED {} of {} ended records were written after their delete",
+                         late_writes, oracle_->endedLives().size());
+        }
+    }
+    const bool pass = oracle_->totalMismatches() == 0 && violations == 0 && late_writes == 0;
+    logger.Info("[TIMELINE-ORACLE] {} mismatches={} map_violations={} late_writes={} absent_ops={} minted={} effective_deletes={} "
                 "reinserts={} write_inserts={} live={}",
-                pass ? "PASS" : "FAILED", oracle_->totalMismatches(), violations, oracle_->totalAbsentOps(),
+                pass ? "PASS" : "FAILED", oracle_->totalMismatches(), violations, late_writes, oracle_->totalAbsentOps(),
                 oracle_->totalMinted(), oracle_->totalEffectiveDeletes(), oracle_->totalReinserts(),
                 oracle_->totalWriteInserts(), oracle_->live().size());
 }
