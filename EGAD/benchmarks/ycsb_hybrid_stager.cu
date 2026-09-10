@@ -145,7 +145,6 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                                             uint32_t cap,
                                             const uint32_t* __restrict__ resident_list,
                                             const uint8_t* __restrict__ needed_flag,
-                                            const uint8_t* __restrict__ flush_pinned_flag,
                                             uint32_t deficit,
                                             uint32_t* __restrict__ out_grids,
                                             uint32_t* __restrict__ out_crids,
@@ -164,7 +163,7 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
 
             uint32_t crid = resident_list[g];
             if (crid == 0xffffffffu) continue;     // empty
-            if (needed_flag[g] || flush_pinned_flag[g]) continue;          // needed -> skip
+            if (needed_flag[g]) continue;          // needed -> skip
 
             uint32_t pos = atomicAdd(out_count, 1u);
             if (pos < deficit) {
@@ -210,20 +209,6 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                                             uint32_t* __restrict__ out_crids) {
         uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i < n) out_crids[i] = grid2crid[grids[i]];
-    }
-
-    __global__ void k_mark_flag_by_grids(const uint32_t* __restrict__ grids,
-                                     uint32_t n,
-                                     uint32_t cap,
-                                     uint8_t* __restrict__ flag)
-    {
-        uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= n) return;
-
-        uint32_t g = grids[i];
-        if (g != 0xffffffffu && g < cap) {
-            flag[g] = 1;
-        }
     }
 
     // Set bitmap[crid] = 1 for every non-sentinel entry in d_insert_keys.
@@ -320,9 +305,9 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         //   plus four spare arrays of headroom in the estimate
         //
         // 7 × uint8_t arrays:
-        //   d_needed_grid_flag_, d_new_is_insert_, d_flush_pinned_flag_,
+        //   d_needed_grid_flag_, d_new_is_insert_,
         //   d_filter_flags_, d_clear_slots0_, d_clear_slots1_,
-        //   plus one spare array of headroom in the estimate
+        //   plus two spare arrays of headroom in the estimate
         //
         // CridGridIndex per-capacity (created inside the constructor):
         //   grid_epoch_last (uint32_t), grid_dirty_v1 (uint8_t), grid_dirty_v2 (uint8_t)
@@ -476,9 +461,6 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         gpu_err_check(cudaMemset(d_new_is_insert_,    0, gpu_capacity_ * sizeof(uint8_t)));
         gpu_err_check(cudaMemset(d_new_insert_count_, 0, sizeof(uint32_t)));
 
-        d_flush_pinned_flag_ = static_cast<uint8_t*>(alloc_.Allocate(gpu_capacity_ * sizeof(uint8_t)));
-        gpu_err_check(cudaMemset(d_flush_pinned_flag_, 0, gpu_capacity_ * sizeof(uint8_t)));
-
         // Reclaim-first eviction (delete-bearing mixes only): per-slot flag,
         // set by mark_reclaimable, drained by the eviction pre-pass.
         reclaim_eviction_active_ = enable_reclaim_eviction;
@@ -545,7 +527,6 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
             // Warmup k_fifo_collect_evictions
             k_fifo_collect_evictions<<<1, 1>>>(0, gpu_capacity_,
                                                 d_resident_list_, d_needed_grid_flag_,
-                                                d_flush_pinned_flag_,
                                                 0,  // deficit=0 → kernel exits immediately
                                                 d_scratch_c_, d_scratch_b_,
                                                 d_scalar_b_, d_scalar_c_);
@@ -692,8 +673,7 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         const uint32_t* d_all_keys, uint32_t n_all,
         const uint32_t* d_read_keys, uint32_t n_read,
         const uint32_t* d_write_keys, uint32_t n_write,
-        const uint32_t* d_insert_keys, uint32_t n_insert,
-        FlushHandle* flush_handle)
+        const uint32_t* d_insert_keys, uint32_t n_insert)
     {
         CpuTimer tc("prepareEpoch(cpu)");
         tl_.reset();
@@ -958,17 +938,14 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                     if (reclaim_eviction_active_) {
                         k_collect_evictions_reclaim_first<<<G, B>>>(gpu_capacity_,
                                                             d_resident_list_, d_needed_grid_flag_,
-                                                            d_flush_pinned_flag_, d_reclaim_flag_,
+                                                            d_reclaim_flag_,
                                                             deficit,
                                                             d_evict_grids, d_evict_crids,
                                                             d_cnt);
                         gpu_err_check(cudaPeekAtLastError());
                     }
-                    // Note that we pass in d_flush_pinned_flag regardless of whether its flush_overlap_enabled
-                    // Because even if its not, its just 0s and we are just ||ing it in the kernel.
                     k_fifo_collect_evictions<<<G, B>>>(fifo_next_grid_, gpu_capacity_,
                                                         d_resident_list_, d_needed_grid_flag_,
-                                                        d_flush_pinned_flag_,
                                                         deficit,
                                                         d_evict_grids, d_evict_crids,
                                                         d_cnt, d_maxoffset);
@@ -986,64 +963,7 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
 
                 if (h_cnt < deficit)
                 {
-                    // Backpressure fallback for very small cache ratios: the
-                    // in-flight writeback's pinned GRIDs plus this epoch's
-                    // needed set can exceed the evictable pool (seen at a 5%
-                    // cache: ~479K pinned of 1M slots). The pins only protect
-                    // flush data until the worker's scatter lands, so wait for
-                    // the worker, drop the pins, and collect once more. Any
-                    // configuration that finds enough candidates on the first
-                    // pass never enters this branch. The sg-transfer gate must
-                    // be released first: the worker parks on sg_transfer_cv_
-                    // between its two scatter halves waiting for this epoch's
-                    // admit transfer, which only runs after eviction, so
-                    // joining without signaling would deadlock. Signaling
-                    // early just lets the second half overlap the upcoming
-                    // gather (the pause is a contention optimization, not a
-                    // correctness gate); this epoch's flush spawn re-arms the
-                    // flag for its own worker.
-                    if (flush_handle && flush_handle->valid && flush_handle->worker.joinable())
-                    {
-                        Logger::GetInstance().Info(
-                            "fifo eviction short ({} evictable, {} needed): waiting for in-flight writeback, dropping its pins, retrying",
-                            h_cnt, deficit);
-                        signal_sg_transfer_done();
-                        flush_handle->worker.join();
-                        gpu_err_check(cudaMemset(d_flush_pinned_flag_, 0, gpu_capacity_ * sizeof(uint8_t)));
-                        gpu_err_check(cudaMemsetAsync(d_cnt, 0, sizeof(uint32_t), 0));
-                        gpu_err_check(cudaMemsetAsync(d_maxoffset, 0, sizeof(uint32_t), 0));
-                        {
-                            GpuTimer tg("fifo:collect_evictions_retry(gpu)");
-                            constexpr int B = 256;
-                            int G = 256;
-                            if (reclaim_eviction_active_) {
-                                k_collect_evictions_reclaim_first<<<G, B>>>(gpu_capacity_,
-                                                                    d_resident_list_, d_needed_grid_flag_,
-                                                                    d_flush_pinned_flag_, d_reclaim_flag_,
-                                                                    deficit,
-                                                                    d_evict_grids, d_evict_crids,
-                                                                    d_cnt);
-                                gpu_err_check(cudaPeekAtLastError());
-                            }
-                            k_fifo_collect_evictions<<<G, B>>>(fifo_next_grid_, gpu_capacity_,
-                                                                d_resident_list_, d_needed_grid_flag_,
-                                                                d_flush_pinned_flag_,
-                                                                deficit,
-                                                                d_evict_grids, d_evict_crids,
-                                                                d_cnt, d_maxoffset);
-                            gpu_err_check(cudaPeekAtLastError());
-                            gpu_err_check(cudaStreamSynchronize(0));
-                        }
-                        k_copy_to_mapped<<<1, 1>>>(d_cnt, d_mapped_scalar_b_);
-                        k_copy_to_mapped<<<1, 1>>>(d_maxoffset, d_mapped_scalar_c_);
-                        gpu_err_check(cudaStreamSynchronize(0));
-                        h_cnt = h_stager_mapped_[5];
-                        h_maxoffset = h_stager_mapped_[6];
-                    }
-                    if (h_cnt < deficit)
-                    {
-                        throw std::runtime_error("HybridStager: FIFO eviction could not find enough evictable entries!");
-                    }
+                    throw std::runtime_error("HybridStager: FIFO eviction could not find enough evictable entries!");
                 }
 
                 // advance cursor
@@ -1513,23 +1433,6 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         gpu_err_check(cudaStreamSynchronize(0));
     }
 
-    void HybridStager::set_flush_pins_for_next_epoch(const FlushHandle* inflight)
-    {
-        // Clear pins from previous epoch
-        gpu_err_check(cudaMemset(d_flush_pinned_flag_, 0, gpu_capacity_ * sizeof(uint8_t)));
-
-        if (!inflight || !inflight->valid || inflight->n == 0) return;
-
-        const uint32_t n = inflight->n;
-
-        // Mark directly from the handle's device buffer (already on GPU from start_flush_epoch_async)
-        constexpr int B = 256;
-        int G = (n + B - 1) / B;
-        k_mark_flag_by_grids<<<G, B>>>(inflight->d_grids, n, gpu_capacity_, d_flush_pinned_flag_);
-        gpu_err_check(cudaPeekAtLastError());
-        gpu_err_check(cudaStreamSynchronize(0));
-    }
-
 
 
     void HybridStager::sync_flush(FlushHandle& h) {
@@ -1643,16 +1546,14 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         gpu_err_check(cudaStreamSynchronize(0));
         }
 
-        // Clear the flush set's dirty bits here, at collect time, rather
-        // than after the writeback drains in sync_flush. A deferred clear
-        // runs after the NEXT epoch's exec, so it is only correct while the
-        // whole flush set stays pinned until then — and the backpressure
-        // fallback in prepareEpoch legitimately drops the pins mid-epoch.
-        // A GRID recycled after that drop would have its freshly-set
-        // executor dirty mark erased when the writer slot collides with the
-        // flushed slot, silently dropping that record's write from every
-        // future flush. Clearing here, before this epoch's eviction can
-        // recycle anything, closes that window.
+        // Clear the flush set's dirty bits here, at collect time, before
+        // this epoch's eviction can recycle any of these GRIDs. The flush
+        // set's values are packed out of the cache below, so nothing the
+        // worker reads depends on the entries afterwards; a GRID recycled
+        // for a new CRID and dirtied by the next epoch's executor must keep
+        // that fresh mark, which a later clear (after the writeback drains)
+        // would erase when the writer slot collides with the flushed slot,
+        // silently dropping that record's write from every future flush.
         crid2grid_index_.clear_dirty_by_grids(out_handle.d_grids, out_handle.d_slots, num_dirty);
         gpu_err_check(cudaStreamSynchronize(0));
 
@@ -1698,16 +1599,8 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
             flush_sync_gpu();
         }
 
-        // valid must be set BEFORE set_flush_pins_for_next_epoch
-        // because that function early-returns on !valid, silently leaving the
-        // pin flag all-zero. With pins not actually set, eviction can pick
-        // GRIDs holding E-1's dirty data, the GRID is reused for a new CRID,
-        // and sync_flush(E-1) later erases the new CRID's executor write.
         sg_transfer_done_.store(false, std::memory_order_release);
         out_handle.valid = true;
-
-        // Set flush pins before spawning worker -- no contention, GPU idle, d_grids ready
-        set_flush_pins_for_next_epoch(&out_handle);
         {
             CpuTimer t("flush_async:spawn_worker");
             auto t_pre_spawn = std::chrono::high_resolution_clock::now();
@@ -1912,7 +1805,6 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
         free_alloc(reinterpret_cast<void*&>(d_new_is_insert_));
         free_alloc(reinterpret_cast<void*&>(d_new_insert_count_));
 
-        free_cuda(reinterpret_cast<void*&>(d_flush_pinned_flag_));
         free_alloc(reinterpret_cast<void*&>(d_reclaim_flag_));
 
         if (h_evict_crids_) { cudaFreeHost(h_evict_crids_); h_evict_crids_ = nullptr; }

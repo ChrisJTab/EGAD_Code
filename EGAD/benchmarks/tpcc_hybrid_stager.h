@@ -118,15 +118,9 @@ public:
     // Flush pipeline (overlap flush(E) with epoch E+1 work)
     // ----------------------------
 
-    // Called near the start of epoch E (before eviction selection / staging).
-    // If inflight == nullptr or !inflight->valid, no pins are applied.
-    // This updates the internal "pinned" set used by FIFO eviction to avoid evicting
-    // records that are being flushed in the background.
-    void set_flush_pins_for_next_epoch(const FlushHandle* inflight);
-
     // Called right after execution(E) ends to prepare flush(E): collect the
-    // dirty set, sort, D2D + pack into the flush SG's device buffer, clear
-    // the dirty bits, and pin the flush set for epoch E+1's eviction. Fills
+    // dirty set, sort, D2D + pack into the flush SG's device buffer, and
+    // clear the dirty bits. Fills
     // out_handle with the metadata later phases need. Does NOT start the
     // D2H + host scatter; submit_flush_worker does. The split lets the epoch
     // loop advance the durable recovery marker at the one sound point:
@@ -361,12 +355,6 @@ private:
     void sg_transfer_versions(const uint32_t* h_crids, const uint32_t* h_grids, uint32_t n, uint32_t epoch);
     void sg_sync();
     void* sg_stream(); // returns the cuda stream (as void*) of sg_record_
-
-    // ----------------------------
-    // Pinned (in-flight flush) set for eviction skipping
-    // ----------------------------
-    // Device flag: d_flush_pinned_flag_[grid] == 1 => grid is pinned (cannot be evicted)
-    uint8_t*  d_flush_pinned_flag_ = nullptr;
 
     // --- reusable host vectors for pre-SG D2H (avoid per-epoch heap alloc) ---
     // Pinned host buffers for pre-SG D2H (avoids copy engine serialization with worker D2H)

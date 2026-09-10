@@ -518,8 +518,7 @@ void TpccDb::runEpoch(uint32_t epoch_id)
             // Flag this epoch's deleted NewOrder rows' cache slots
             // reclaim-first before eviction runs (single-threaded region,
             // before the parallel sections). Safe within the deleting
-            // epoch: any slot the epoch still touches is needed-protected,
-            // and a slot with an in-flight writeback is pinned.
+            // epoch: any slot the epoch still touches is needed-protected.
             if (config.txn_mix.delivery > 0) {
                 if (auto* gi = dynamic_cast<TpccGpuIndex<TpccTxnArrayT, TpccTxnParamArrayT>*>(index.get())) {
                     new_order_stager->mark_reclaimable(gi->noDeleteCridsDevice(), gi->numNoDeletesThisEpoch());
@@ -693,7 +692,7 @@ void TpccDb::runEpoch(uint32_t epoch_id)
                 {
                     // Fused: each stager drains its own E-1 writeback
                     // (sync_flush) and immediately prepares E's flush
-                    // (start_flush_epoch_async: collect, sort, pack, pin),
+                    // (start_flush_epoch_async: collect, sort, pack),
                     // all 8 stagers concurrently — same OMP-sections
                     // dispatch and per-stager-stream isolation contract as
                     // prepareEpoch above. A light stager's flush preparation

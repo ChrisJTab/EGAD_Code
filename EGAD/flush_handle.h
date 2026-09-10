@@ -15,7 +15,7 @@ namespace epic::ycsb {
         bool valid = false;
 
         // Flush-set inputs the worker scatter reads (the matching GRIDs live
-        // in d_grids below; the set also serves as the eviction pin source).
+        // in d_grids below).
         std::vector<uint32_t> h_crids;
         std::vector<uint8_t>  h_slots;   // per-entry version-slot index (0 = slot 1, 1 = slot 2)
 

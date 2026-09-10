@@ -4,11 +4,11 @@
 // A stager can flag cache slots whose records are logically dead (deleted
 // keys; TPC-C's delivered OrderLine rows are the same pattern) so its
 // eviction pass drains them before touching live residents. The flag is a
-// preference, not a pin: flagged slots still honor the needed-set
-// protection and the in-flight-writeback pin, which is what keeps
-// reclaiming race-free -- a dead record dirtied in its final epoch stays
-// pinned until its writeback lands, and one that the current epoch still
-// reads stays needed-protected until the epoch ends.
+// preference, not an override: flagged slots still honor the needed-set
+// protection, so a dead record that the current epoch still reads stays
+// resident until the epoch ends. A dead record dirtied in its final epoch
+// is safe to evict afterwards because the writeback packs the flush set
+// out of the cache at collect time, before the next eviction runs.
 //
 
 #ifndef EPIC_BENCHMARKS_RECLAIM_FLAGS_CUH
@@ -63,7 +63,6 @@ static __global__ void k_clear_reclaim_by_grids(const uint32_t* __restrict__ gri
 static __global__ void k_collect_evictions_reclaim_first(uint32_t cap,
                                                          const uint32_t* __restrict__ resident_list,
                                                          const uint8_t* __restrict__ needed_flag,
-                                                         const uint8_t* __restrict__ flush_pinned_flag,
                                                          const uint8_t* __restrict__ reclaim_flag,
                                                          uint32_t deficit,
                                                          uint32_t* __restrict__ out_grids,
@@ -77,7 +76,7 @@ static __global__ void k_collect_evictions_reclaim_first(uint32_t cap,
         if (atomicAdd(out_count, 0u) >= deficit) break;
         uint32_t crid = resident_list[g];
         if (crid == 0xffffffffu) continue;
-        if (needed_flag[g] || flush_pinned_flag[g]) continue;
+        if (needed_flag[g]) continue;
         if (!reclaim_flag[g]) continue;
         uint32_t pos = atomicAdd(out_count, 1u);
         if (pos < deficit) {

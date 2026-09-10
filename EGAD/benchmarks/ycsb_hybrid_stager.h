@@ -94,29 +94,22 @@ public:
     const uint32_t* d_all_keys, uint32_t n_all,
     const uint32_t* d_read_keys, uint32_t n_read,
     const uint32_t* d_write_keys, uint32_t n_write,
-    const uint32_t* d_insert_keys, uint32_t n_insert,
-    FlushHandle* flush_handle = nullptr);
+    const uint32_t* d_insert_keys, uint32_t n_insert);
     void periodicFlush(uint32_t epoch);
 
     // Flag the cache slots of this epoch's deleted CRIDs reclaim-first.
     // Called before prepareEpoch each epoch on delete-bearing mixes; the
     // eviction pass then drains flagged slots ahead of live residents
-    // once their needed-set protection and writeback pins lapse. No-op
-    // when reclaim eviction is disabled or n is 0.
+    // once their needed-set protection lapses. No-op when reclaim
+    // eviction is disabled or n is 0.
     void mark_reclaimable(const uint32_t* d_crids, uint32_t n);
 
     // ----------------------------
     // Flush pipeline (overlap flush(E) with epoch E+1 work)
     // ----------------------------
 
-    // Called near the start of epoch E (before eviction selection / staging).
-    // If inflight == nullptr or !inflight->valid, no pins are applied.
-    // This updates the internal "pinned" set used by FIFO eviction to avoid evicting
-    // records that are being flushed in the background.
-    void set_flush_pins_for_next_epoch(const FlushHandle* inflight);
-
     // Called right after execution(E) ends to begin flush(E) asynchronously.
-    // Fills out_handle with events/metadata needed for later sync and for pinning in epoch E+1.
+    // Fills out_handle with events/metadata needed for later sync.
     void start_flush_epoch_async(uint32_t epoch, FlushHandle& out_handle);
 
     // Called near the end of epoch E to enforce the "deadline" that flush(E-1) is complete.
@@ -265,12 +258,6 @@ private:
     void sg_transfer_versions(const uint32_t* h_crids, const uint32_t* h_grids, uint32_t n, uint32_t epoch);
     void sg_sync();
     void* sg_stream(); // returns the cuda stream (as void*) of the active SG
-
-    // ----------------------------
-    // Pinned (in-flight flush) set for eviction skipping
-    // ----------------------------
-    // Device flag: d_flush_pinned_flag_[grid] == 1 => grid is pinned (cannot be evicted)
-    uint8_t*  d_flush_pinned_flag_ = nullptr;
 
     // Reclaim-first eviction (delete-bearing mixes): per-slot flag set by
     // mark_reclaimable, preferred by the eviction pre-pass, cleared on

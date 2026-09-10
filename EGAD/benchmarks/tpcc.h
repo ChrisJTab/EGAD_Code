@@ -104,10 +104,8 @@ private:
     std::shared_ptr<OrderLineStager> order_line_stager;
 
     // 8 per-table FlushHandles for async flush (overlap_flush mode).
-    // One handle per stager; never cross-wired (each stager's eviction
-    // pins must come from its own handle's d_grids list, otherwise a
-    // worker's in-flight slot can be selected as a rename victim by
-    // its own next-epoch eviction). FlushHandle holds a std::thread,
+    // One handle per stager, never cross-wired: each holds its own
+    // stager's flush set and worker. FlushHandle holds a std::thread,
     // mutex, and condition_variable, so it is non-copyable and non-
     // movable — these are named members rather than a vector.
     FlushHandle warehouse_flush;

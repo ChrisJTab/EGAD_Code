@@ -506,24 +506,20 @@ void YcsbBenchmark::runEpoch(uint32_t epoch_id, FlushHandle& flush_inflight)
                 // Flag this epoch's deleted records' cache slots
                 // reclaim-first before eviction runs. Safe within the
                 // deleting epoch itself: any slot the epoch still touches
-                // is needed-protected, and a slot with an in-flight
-                // writeback is pinned, so the flag only accelerates
+                // is needed-protected, so the flag only accelerates
                 // draining slots nothing needs anymore.
                 if (config.txn_mix.num_deletes > 0) {
                     if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) {
                         stager->mark_reclaimable(gi->deleteCridsDevice(), gi->numDeletesThisEpoch());
                     }
                 }
-                // Pass flush handle so scatter can be spawned after SG transfer
-                FlushHandle* fh = (config.overlap_flush && flush_inflight.valid) ? &flush_inflight : nullptr;
                 stager->prepareEpoch(epoch_id,
                      execution_param_input,
                      execution_plan_input,
                      planner->d_all_keys,  n_all,
                      planner->d_read_keys, n_read,
                      planner->d_write_keys, n_write,
-                     planner->d_insert_keys, n_insert,
-                     fh);
+                     planner->d_insert_keys, n_insert);
             }
             end_time = std::chrono::high_resolution_clock::now();
             logger.Info("Epoch {} staging time: {} us", epoch_id,
