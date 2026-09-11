@@ -43,17 +43,20 @@ inline bool flatOLEnabled(ExecMode mode)
     return envBoolOrHybridDefault("EPIC_FLAT_INDEX_OL", mode);
 }
 
-// Per-(w,d) OrderLine dense-index stride for the flat-OL path. Derived
-// from cfg.orderLineTableSize(): max_o = ceil(table_size / (W * 10 * 15)).
-// Picks up the mix-realistic pool sizing (EPIC_MIX_REALISTIC_SIZING)
-// when set, rather than the worst-case formula. Shared by the GPU flat
-// index allocation and the CPU shadow OL encoding so both use the same
-// dense_idx -> slot mapping.
+// Per-(w,d) OrderLine dense-index stride for the flat-OL path: the 3000
+// initial orders of a district plus the per-district share of the order
+// insert pool (cfg.newOrderInsertPoolSize(), which carries the sizing
+// safety factor). Dividing the OrderLine row pool by the maximum lines per
+// order instead, as an earlier version did, left each district exactly its
+// expected order count and let the busiest districts run past their stride
+// late in long runs, aliasing their lines onto the next district's slots.
+// Shared by the GPU flat index allocation and the CPU shadow OL encoding so
+// both use the same dense_idx -> slot mapping.
 inline uint32_t computeOLMaxO(const TpccConfig& cfg)
 {
-    const uint64_t denom = static_cast<uint64_t>(cfg.num_warehouses) * 10ull * 15ull;
-    const uint64_t total = static_cast<uint64_t>(cfg.orderLineTableSize());
-    return static_cast<uint32_t>((total + denom - 1ull) / denom);
+    const uint64_t districts = static_cast<uint64_t>(cfg.num_warehouses) * 10ull;
+    const uint64_t pool = static_cast<uint64_t>(cfg.newOrderInsertPoolSize());
+    return static_cast<uint32_t>(3000ull + (pool + districts - 1ull) / districts);
 }
 
 // Compute the dense linear index for an OrderLine row. Caller supplies
@@ -86,13 +89,17 @@ struct OrderLineFlatView
     uint32_t* d_array = nullptr;  // size = W * 10 * max_o * 15
     uint32_t  max_o   = 0;
 
+    // An order id past the stride has no slot; it resolves to no record
+    // rather than to another district's line.
     __host__ __device__ __forceinline__
     uint32_t find(OrderLineKey key) const {
+        if (key.ol_o_id > max_o) return 0xffffffffu;
         return d_array[denseIdxOL(key, max_o)];
     }
 
     __host__ __device__ __forceinline__
     void insert(OrderLineKey key, uint32_t value) const {
+        if (key.ol_o_id > max_o) return;
         d_array[denseIdxOL(key, max_o)] = value;
     }
 };

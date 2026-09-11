@@ -809,11 +809,13 @@ __global__ void k_flat_ol_assign_many(const OrderLineKey::baseType* __restrict__
 // Flat OL bulk insert that reports keys already present (a second insert
 // of a key the table holds), so the epoch can fall back to the timeline.
 __global__ void k_flat_ol_bulk_insert_checked(const OrderLineKey::baseType* __restrict__ keys,
-    const uint32_t* __restrict__ values, uint32_t n, OrderLineFlatView view, uint32_t* __restrict__ rejected)
+    const uint32_t* __restrict__ values, uint32_t n, OrderLineFlatView view, uint32_t* __restrict__ rejected,
+    uint32_t* __restrict__ out_of_range)
 {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     OrderLineKey k; k.base_key = keys[i];
+    if (k.ol_o_id > view.max_o) { atomicAdd(out_of_range, 1u); return; }
     uint32_t* slot = view.d_array + denseIdxOL(k, view.max_o);
     if (atomicCAS(slot, kAbsent, values[i]) != kAbsent) atomicAdd(rejected, 1u);
 }
@@ -917,7 +919,7 @@ public:
     epic::timeline::EpochTimeline<OrderKey::baseType, 24> o_tl_;
     epic::timeline::EpochTimeline<OrderLineKey::baseType, 22> ol_tl_;
     uint32_t *d_no_ins_entry = nullptr, *d_o_ins_entry = nullptr, *d_ol_ins_entry = nullptr;
-    uint32_t *d_flat_rejected = nullptr, *h_flat_rejected = nullptr;   // mapped
+    uint32_t *d_flat_rejected = nullptr, *h_flat_rejected = nullptr;   // mapped: [0] rejected (key held), [1] out of range
     uint32_t no_delete_count = 0;          // cumulative; the durable NO delete-log cursor
     uint32_t num_no_deletes_this_epoch = 0;
     bool no_general_ = false, o_general_ = false, ol_general_ = false;   // this epoch's paths
@@ -1066,8 +1068,8 @@ public:
         gpu_err_check(cudaMalloc(&d_no_ins_entry, tpcc_config.num_txns * sizeof(uint32_t)));
         gpu_err_check(cudaMalloc(&d_o_ins_entry, tpcc_config.num_txns * sizeof(uint32_t)));
         gpu_err_check(cudaMalloc(&d_ol_ins_entry, tpcc_config.num_txns * 15 * sizeof(uint32_t)));
-        gpu_err_check(cudaHostAlloc(&h_flat_rejected, sizeof(uint32_t), cudaHostAllocMapped));
-        *h_flat_rejected = 0;
+        gpu_err_check(cudaHostAlloc(&h_flat_rejected, 2 * sizeof(uint32_t), cudaHostAllocMapped));
+        h_flat_rejected[0] = 0; h_flat_rejected[1] = 0;
         gpu_err_check(cudaHostGetDevicePointer(&d_flat_rejected, h_flat_rejected, 0));
         {
             size_t b = 0;
@@ -1402,13 +1404,18 @@ public:
         }
         if (!ol_general_ && num_order_lines_inserts > 0) {
             if (use_flat_ol_index_) {
-                *h_flat_rejected = 0;
+                h_flat_rejected[0] = 0; h_flat_rejected[1] = 0;
                 k_flat_ol_bulk_insert_checked<<<blocks_for(num_order_lines_inserts), 256>>>(
                     d_order_line_valid_insert, d_order_line_free_rows + order_line_free_start,
-                    num_order_lines_inserts, index_device_view.order_line_flat_view, d_flat_rejected);
+                    num_order_lines_inserts, index_device_view.order_line_flat_view, d_flat_rejected, d_flat_rejected + 1);
                 gpu_err_check(cudaPeekAtLastError());
                 gpu_err_check(cudaDeviceSynchronize());
-                if (*h_flat_rejected != 0) {
+                if (h_flat_rejected[1] != 0) {
+                    throw std::runtime_error("OrderLine flat index: " + std::to_string(h_flat_rejected[1]) +
+                        " order ids exceed the per-district stride (" + std::to_string(order_line_flat_max_o_) +
+                        ") in epoch " + std::to_string(epoch_id) + "; the order insert pool is too small for this run");
+                }
+                if (h_flat_rejected[0] != 0) {
                     logger.Info("Epoch {}: OrderLine insert rejected, resolving through the timeline", epoch_id);
                     undoAcceptedFlatOL(num_order_lines_inserts, ol_init + ol_old);
                     ol_general_ = true;
