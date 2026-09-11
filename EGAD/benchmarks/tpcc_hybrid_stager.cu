@@ -3,6 +3,7 @@
 //
 
 #include "tpcc_hybrid_stager.h"
+#include <algorithm>
 #include <unistd.h>
 #include <gpu_txn.cuh>
 #include <util_gpu_error_check.cuh>
@@ -1116,6 +1117,9 @@ throw std::runtime_error(std::string("CUB/CUDA error: ") + cudaGetErrorString(_e
                 gpu_err_check(cudaStreamSynchronize(s));
                 h_cnt = h_stager_mapped_[5];
                 h_maxoffset = h_stager_mapped_[6];
+#ifdef EGAD_VALIDATION
+                checkEvictionListDistinct(d_evict_grids, std::min(h_cnt, deficit), "tpcc");
+#endif
 
 
                 if (h_cnt < deficit)

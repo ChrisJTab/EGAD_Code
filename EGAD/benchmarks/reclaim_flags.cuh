@@ -15,8 +15,14 @@
 #define EPIC_BENCHMARKS_RECLAIM_FLAGS_CUH
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 #ifdef EPIC_CUDA_AVAILABLE
+
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+#include <thrust/unique.h>
 
 namespace epic {
 
@@ -58,11 +64,13 @@ static __global__ void k_clear_reclaim_by_grids(const uint32_t* __restrict__ gri
 // Reclaim-first victim collection: pick flagged slots only, sharing the
 // out_count atomic with the FIFO scan that runs after it -- if this pass
 // fills the deficit the FIFO scan early-exits, otherwise the FIFO scan
-// tops up from where this left off. No cursor bookkeeping: reclaimed
-// slots are off-order by design.
+// tops up from where this left off. A picked slot is also marked in the
+// epoch's needed flags, which the FIFO scan skips, so no slot is picked by
+// both passes (two picks would bind two records to one slot). No cursor
+// bookkeeping: reclaimed slots are off-order by design.
 static __global__ void k_collect_evictions_reclaim_first(uint32_t cap,
                                                          const uint32_t* __restrict__ resident_list,
-                                                         const uint8_t* __restrict__ needed_flag,
+                                                         uint8_t* __restrict__ needed_flag,
                                                          const uint8_t* __restrict__ reclaim_flag,
                                                          uint32_t deficit,
                                                          uint32_t* __restrict__ out_grids,
@@ -82,9 +90,24 @@ static __global__ void k_collect_evictions_reclaim_first(uint32_t cap,
         if (pos < deficit) {
             out_grids[pos] = g;
             out_crids[pos] = crid;
+            needed_flag[g] = 1;
         }
     }
 }
+
+#ifdef EGAD_VALIDATION
+// Validation build: an eviction list must not name a slot twice.
+inline void checkEvictionListDistinct(const uint32_t* d_grids, uint32_t n, const char* stager)
+{
+    if (n < 2) return;
+    thrust::device_vector<uint32_t> grids(d_grids, d_grids + n);
+    thrust::sort(grids.begin(), grids.end());
+    if (thrust::unique(grids.begin(), grids.end()) != grids.end()) {
+        throw std::runtime_error(std::string("[EVICT-CHECK] FAILED: ") + stager +
+                                 " eviction list names a cache slot twice");
+    }
+}
+#endif
 
 } // namespace epic
 
