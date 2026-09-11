@@ -160,7 +160,7 @@ void __global__ indexYcsbKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDev
         uint32_t rid = fastLookup(index_view, txn_ptr->keys[i], slot, minted_begin, num_minted, ins_slot);
         if (del_pos != nullptr && rid != kAbsent && del_pos[rid] < slot) rid = kAbsent;
         index_ptr->record_ids[i] = rid;
-        index_ptr->ops[i] = txn_ptr->ops[i];
+        index_ptr->ops[i] = (rid == kAbsent) ? YcsbOpType::NOOP : txn_ptr->ops[i];
         index_ptr->field_ids[i] = txn_ptr->fields[i];
     }
 }
@@ -193,7 +193,7 @@ void __global__ indexYcsbTimelineKernel(GpuTxnArray txn, GpuTxnArray index, Ycsb
         const uint32_t slot = static_cast<uint32_t>(tid * 10 + i);
         rid = tl.resolve(key, slot, slot, txn_ptr->ops[i] == YcsbOpType::INSERT, rid);
         index_ptr->record_ids[i] = rid;
-        index_ptr->ops[i] = txn_ptr->ops[i];
+        index_ptr->ops[i] = (rid == kAbsent) ? YcsbOpType::NOOP : txn_ptr->ops[i];
         index_ptr->field_ids[i] = txn_ptr->fields[i];
     }
 }

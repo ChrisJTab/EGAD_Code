@@ -159,13 +159,6 @@ __global__ void gpuPiecewiseExecKernel(YcsbConfig config, void *records, void *v
 
     uint32_t data = 0;
 
-    // An op with no record (absent at its serial position) was not planned;
-    // nothing to execute.
-    if (txn->record_ids[warp_piece_id] == 0xffffffffu)
-    {
-        return;
-    }
-
     switch (txn->ops[warp_piece_id])
     {
     case YcsbOpType::READ: {
@@ -231,7 +224,9 @@ __global__ void gpuPiecewiseExecKernel(YcsbConfig config, void *records, void *v
         break;
     }
     case YcsbOpType::DELETE:
-        // Index-phase operation; contributes no record work and no plan entry.
+    case YcsbOpType::NOOP:
+        // Index-phase operation, or an op that resolved to no record at its
+        // serial position; neither has record work or a plan entry.
         break;
     default:
         assert(false);
@@ -286,13 +281,6 @@ __global__ void gpuNoSplitPiecewiseExecKernel(YcsbConfig config, void *records, 
 
     uint32_t data = 0;
 
-    // An op with no record (absent at its serial position) was not planned;
-    // nothing to execute.
-    if (txn->record_ids[warp_piece_id] == 0xffffffffu)
-    {
-        return;
-    }
-
     switch (txn->ops[warp_piece_id])
     {
     case YcsbOpType::READ: {
@@ -333,7 +321,9 @@ __global__ void gpuNoSplitPiecewiseExecKernel(YcsbConfig config, void *records, 
         break;
     }
     case YcsbOpType::DELETE:
-        // Index-phase operation; contributes no record work and no plan entry.
+    case YcsbOpType::NOOP:
+        // Index-phase operation, or an op that resolved to no record at its
+        // serial position; neither has record work or a plan entry.
         break;
     default:
         printf("Invalid op type: %s\n", YcsbOpTypeToString(txn->ops[warp_piece_id]));
@@ -383,11 +373,6 @@ __global__ void gpuNoSplitThreadPiecewiseExecKernel(YcsbConfig config, void *rec
 
     uint32_t data = 0;
 
-    if (txn->record_ids[thread_piece_id] == 0xffffffffu)
-    {
-        return;
-    }
-
     switch (txn->ops[thread_piece_id])
     {
     case YcsbOpType::READ: {
@@ -430,7 +415,9 @@ __global__ void gpuNoSplitThreadPiecewiseExecKernel(YcsbConfig config, void *rec
         break;
     }
     case YcsbOpType::DELETE:
-        // Index-phase operation; contributes no record work and no plan entry.
+    case YcsbOpType::NOOP:
+        // Index-phase operation, or an op that resolved to no record at its
+        // serial position; neither has record work or a plan entry.
         break;
     default:
         printf("Invalid op type: %s\n", YcsbOpTypeToString(txn->ops[thread_piece_id]));
