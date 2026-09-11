@@ -45,9 +45,9 @@ public:
     // The CRID range minted by this epoch's indexing (see
     // YcsbGpuIndex::mintedBegin): an INSERT op resolving inside it creates
     // its record; one resolving outside it is a write to an existing record.
-    uint32_t minted_begin_ = 0;
-    uint32_t num_minted_ = 0;
-    void setMintedRange(uint32_t begin, uint32_t count) { minted_begin_ = begin; num_minted_ = count; }
+    uint32_t minted_begin = 0;
+    uint32_t num_minted = 0;
+    void setMintedRange(uint32_t begin, uint32_t count) { minted_begin = begin; num_minted = count; }
     YcsbSubmitter(TableSubmitDest submit_dest, YcsbConfig config)
         : submit_dest(submit_dest)
         , config(config)

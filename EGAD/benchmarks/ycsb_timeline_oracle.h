@@ -44,7 +44,7 @@ public:
 
     const ankerl::unordered_dense::map<uint32_t, uint32_t>& live() const { return live_; }
     // Keys that were deleted and are not live now (bounded sample).
-    std::vector<uint32_t> deadSample(size_t max_n) const;
+    std::vector<uint32_t> deadKeys() const;   // every key currently dead (deleted, not re-inserted)
     // Every record whose life ended, with the epoch of the delete that
     // ended it: no write may reach such a record in a later epoch.
     const std::vector<std::pair<uint32_t, uint32_t>>& endedLives() const { return ended_; }

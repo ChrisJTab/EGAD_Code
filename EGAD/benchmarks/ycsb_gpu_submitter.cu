@@ -65,7 +65,7 @@ void __global__ prepareSubmitYcsbTxn(YcsbConfig config, GpuTxnArray txns, uint32
         // An op that resolved to no record (its key is absent at the op's
         // serial position) is not submitted: a read returns nothing, a
         // write has no effect.
-        if (txn->record_ids[i] == 0xffffffffu) continue;
+        if (txn->record_ids[i] == kNoRecord) continue;
         switch (txn->ops[i])
         {
         case YcsbOpType::READ:
@@ -176,7 +176,7 @@ void __global__ submitYcsbTxn(YcsbConfig config, GpuTxnArray txns, uint32_t *off
         // Absent at the op's serial position: not submitted (see
         // prepareSubmitYcsbTxn). An INSERT creates its record only when the
         // record was minted this epoch; otherwise it writes an existing one.
-        if (txn->record_ids[i] == 0xffffffffu) continue;
+        if (txn->record_ids[i] == kNoRecord) continue;
         const bool op_is_insert_kind = (txn->ops[i] == YcsbOpType::INSERT)
             && (txn->record_ids[i] - minted_begin < num_minted);
         switch (txn->ops[i])
@@ -326,7 +326,7 @@ void YcsbGpuSubmitter::submit(TxnArray<YcsbTxnParam> &txn_array)
     submitYcsbTxn<<<num_blocks, block_size>>>(config, GpuTxnArray(txn_array), submit_dest.d_op_offsets,
         reinterpret_cast<op_t *>(submit_dest.d_submitted_ops),
         submit_dest.d_op_is_insert,
-        config.num_txns, minted_begin_, num_minted_);
+        config.num_txns, minted_begin, num_minted);
 
     gpu_err_check(cudaGetLastError());
 

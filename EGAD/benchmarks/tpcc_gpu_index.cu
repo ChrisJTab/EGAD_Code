@@ -781,13 +781,6 @@ __global__ void k_no_effective_deletes(GpuTxnArrayType txn, GpuTxnIndexArrayType
     }
 }
 
-__global__ void k_reset_del_pos(const uint32_t* __restrict__ crids, uint32_t n, uint32_t* __restrict__ del_pos)
-{
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    del_pos[crids[i]] = kAbsent;
-}
-
 // Flat OL index helpers for the timeline path: epoch-start lookup of the
 // event keys, and the final-life assignment at the epoch boundary.
 __global__ void k_flat_ol_find_many(const OrderLineKey::baseType* __restrict__ keys, uint32_t n,
@@ -862,6 +855,12 @@ public:
     // universe: real packed keys leave the upper bits zero.
     static constexpr cuco::erased_key<NewOrderKey::baseType> new_order_erased_sentinel{
         static_cast<NewOrderKey::baseType>(-2)};
+    // Order and OrderLine have no deletes, but a rejected insert of theirs
+    // is undone by erasing the tentative entries (epic::timeline::eraseTentative).
+    static constexpr cuco::erased_key<OrderKey::baseType> order_erased_sentinel{
+        static_cast<OrderKey::baseType>(-2)};
+    static constexpr cuco::erased_key<OrderLineKey::baseType> order_line_erased_sentinel{
+        static_cast<OrderLineKey::baseType>(-2)};
 
     TpccConfig tpcc_config;
 
@@ -918,11 +917,18 @@ public:
     epic::timeline::EpochTimeline<NewOrderKey::baseType, 24> no_tl_;
     epic::timeline::EpochTimeline<OrderKey::baseType, 24> o_tl_;
     epic::timeline::EpochTimeline<OrderLineKey::baseType, 22> ol_tl_;
+    static_assert(NewOrderKey::kKeyBits + 24 <= 64, "NewOrder key and serial position must pack into 64 bits");
+    static_assert(OrderKey::kKeyBits + 24 <= 64, "Order key and serial position must pack into 64 bits");
+    static_assert(OrderLineKey::kKeyBits + 22 <= 64, "OrderLine key and serial position must pack into 64 bits");
     uint32_t *d_no_ins_entry = nullptr, *d_o_ins_entry = nullptr, *d_ol_ins_entry = nullptr;
     uint32_t *d_flat_rejected = nullptr, *h_flat_rejected = nullptr;   // mapped: [0] rejected (key held), [1] out of range
     uint32_t no_delete_count = 0;          // cumulative; the durable NO delete-log cursor
     uint32_t num_no_deletes_this_epoch = 0;
     bool no_general_ = false, o_general_ = false, ol_general_ = false;   // this epoch's paths
+    // Once a map has erased anything, its fast path checks the epoch's
+    // inserts against the map itself (see epic::timeline::insertFresh).
+    bool no_has_erased_ = false, o_has_erased_ = false, ol_has_erased_ = false;
+    uint32_t *d_insert_check_ = nullptr;   // scratch of that check: one id per insert entry
     // NewOrder fast delete path (Delivery-bearing hybrid runs without a
     // rejected insert): del_pos per NO record (allocated on first use), the
     // per-slot effective-delete columns (tid*10 + district) and their
@@ -979,10 +985,10 @@ public:
               value_sentinel, new_order_erased_sentinel)}
         , order_index{std::make_shared<OrderIndexType>(
               static_cast<size_t>(std::ceil(tpcc_config.orderTableSize() / load_factor)), order_key_sentinel,
-              value_sentinel)}
+              value_sentinel, order_erased_sentinel)}
         , order_line_index{std::make_shared<OrderLineIndexType>(
               cucoOLCapacity(tpcc_config), order_line_key_sentinel,
-              value_sentinel)}
+              value_sentinel, order_line_erased_sentinel)}
         , item_index{std::make_shared<ItemIndexType>(
               static_cast<size_t>(std::ceil(tpcc_config.itemTableSize() / load_factor)), item_key_sentinel,
               value_sentinel)}
@@ -1068,13 +1074,14 @@ public:
         gpu_err_check(cudaMalloc(&d_no_ins_entry, tpcc_config.num_txns * sizeof(uint32_t)));
         gpu_err_check(cudaMalloc(&d_o_ins_entry, tpcc_config.num_txns * sizeof(uint32_t)));
         gpu_err_check(cudaMalloc(&d_ol_ins_entry, tpcc_config.num_txns * 15 * sizeof(uint32_t)));
+        gpu_err_check(cudaMalloc(&d_insert_check_, tpcc_config.num_txns * 15 * sizeof(uint32_t)));
         gpu_err_check(cudaHostAlloc(&h_flat_rejected, 2 * sizeof(uint32_t), cudaHostAllocMapped));
         h_flat_rejected[0] = 0; h_flat_rejected[1] = 0;
         gpu_err_check(cudaHostGetDevicePointer(&d_flat_rejected, h_flat_rejected, 0));
         {
             size_t b = 0;
             cub::DeviceSelect::If(nullptr, b, thrust::counting_iterator<uint32_t>(0), d_ol_ins_entry,
-                d_order_line_num_insert, tpcc_config.num_txns * 15, epic::timeline::detail::EntryHasKey<OrderLineKey::baseType>{d_order_line_insert});
+                d_order_line_num_insert, tpcc_config.num_txns * 15, epic::timeline::EntryHasKey<OrderLineKey::baseType>{d_order_line_insert});
             if (b > temp_storage_bytes) {
                 gpu_err_check(cudaFree(d_temp_storage));
                 temp_storage_bytes = b;
@@ -1342,17 +1349,17 @@ public:
             d_order_num_insert, tpcc_config.num_txns,
             [] __device__(OrderKey::baseType val) { return val != static_cast<OrderKey::baseType>(-1); });
         cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, thrust::counting_iterator<uint32_t>(0), d_o_ins_entry,
-            d_order_num_insert, tpcc_config.num_txns, epic::timeline::detail::EntryHasKey<OrderKey::baseType>{d_order_insert});
+            d_order_num_insert, tpcc_config.num_txns, epic::timeline::EntryHasKey<OrderKey::baseType>{d_order_insert});
         cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, d_new_order_insert, d_new_order_valid_insert,
             d_new_order_num_insert, tpcc_config.num_txns,
             [] __device__(NewOrderKey::baseType val) { return val != static_cast<NewOrderKey::baseType>(-1); });
         cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, thrust::counting_iterator<uint32_t>(0), d_no_ins_entry,
-            d_new_order_num_insert, tpcc_config.num_txns, epic::timeline::detail::EntryHasKey<NewOrderKey::baseType>{d_new_order_insert});
+            d_new_order_num_insert, tpcc_config.num_txns, epic::timeline::EntryHasKey<NewOrderKey::baseType>{d_new_order_insert});
         cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, d_order_line_insert, d_order_line_valid_insert,
             d_order_line_num_insert, tpcc_config.num_txns * 15,
             [] __device__(OrderLineKey::baseType val) { return val != static_cast<OrderLineKey::baseType>(-1); });
         cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, thrust::counting_iterator<uint32_t>(0), d_ol_ins_entry,
-            d_order_line_num_insert, tpcc_config.num_txns * 15, epic::timeline::detail::EntryHasKey<OrderLineKey::baseType>{d_order_line_insert});
+            d_order_line_num_insert, tpcc_config.num_txns * 15, epic::timeline::EntryHasKey<OrderLineKey::baseType>{d_order_line_insert});
 
         uint32_t num_orders_inserts, num_new_orders_inserts, num_order_lines_inserts;
         gpu_err_check(cudaMemcpy(&num_orders_inserts, d_order_num_insert, sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -1365,9 +1372,9 @@ public:
         logger.Trace("Number of new orders inserts: {}", num_new_orders_inserts);
         logger.Trace("Number of order lines inserts: {}", num_order_lines_inserts);
 
-        // Which tables take the timeline path this epoch. NewOrder always
-        // does on Delivery-bearing hybrid runs (it has deletes); Order and
-        // OrderLine fall back to it when the bulk insert rejects a key.
+        // Which tables take the timeline path this epoch: any table whose
+        // inserts are not all of fresh keys (a key it holds, or one inserted
+        // twice); NewOrder's deletes otherwise stay on the fast delete path.
         const bool delete_path = tpcc_config.execution_mode == ExecMode::HYBRID_STAGING
             && tpcc_config.txn_mix.delivery > 0;
         no_general_ = false;
@@ -1378,27 +1385,30 @@ public:
         // path, so the workloads without duplicate keys exercise it and must
         // reproduce the fast path's results exactly.
         static const bool kForceGeneral = std::getenv("EPIC_TIMELINE_FORCE_GENERAL") != nullptr;
-        if (kForceGeneral) { no_general_ = true; o_general_ = true; ol_general_ = true; }
+        if (kForceGeneral) { no_general_ = delete_path; o_general_ = true; ol_general_ = true; }
 #endif
 
-        // --- fast paths: bulk inserts, rejection detection, fallback ---
+        // --- fast paths: bulk inserts of fresh keys, fallback otherwise ---
+        thrust::device_ptr<uint32_t> insert_check(d_insert_check_);
         if (!o_general_ && num_orders_inserts > 0) {
-            const std::size_t before = order_index->get_size();
-            auto zipped = thrust::make_zip_iterator(thrust::make_tuple(dp_order_valid_insert, dp_order_free_rows + order_free_start));
-            order_index->insert(zipped, zipped + num_orders_inserts);
-            if (order_index->get_size() - before != num_orders_inserts) {
-                logger.Info("Epoch {}: Order insert rejected, resolving through the timeline", epoch_id);
-                undoAccepted(order_index, dp_order_valid_insert, num_orders_inserts, o_init + o_old);
+            if (!epic::timeline::insertFresh(*order_index, o_has_erased_, dp_order_valid_insert,
+                                             dp_order_free_rows + order_free_start, num_orders_inserts, o_init + o_old,
+                                             insert_check)) {
+                logger.Info("Epoch {}: an Order insert is not of a fresh key, resolving through the timeline", epoch_id);
+                if (epic::timeline::eraseTentative(*order_index, dp_order_valid_insert, num_orders_inserts, o_init + o_old) > 0) {
+                    o_has_erased_ = true;
+                }
                 o_general_ = true;
             }
         }
         if (!no_general_ && num_new_orders_inserts > 0) {
-            const std::size_t before = new_order_index->get_size();
-            auto zipped = thrust::make_zip_iterator(thrust::make_tuple(dp_new_order_valid_insert, dp_new_order_free_rows + new_order_free_start));
-            new_order_index->insert(zipped, zipped + num_new_orders_inserts);
-            if (new_order_index->get_size() - before != num_new_orders_inserts) {
-                logger.Info("Epoch {}: NewOrder insert rejected, resolving through the timeline", epoch_id);
-                undoAccepted(new_order_index, dp_new_order_valid_insert, num_new_orders_inserts, no_init + no_old);
+            if (!epic::timeline::insertFresh(*new_order_index, no_has_erased_, dp_new_order_valid_insert,
+                                             dp_new_order_free_rows + new_order_free_start, num_new_orders_inserts,
+                                             no_init + no_old, insert_check)) {
+                logger.Info("Epoch {}: a NewOrder insert is not of a fresh key, resolving through the timeline", epoch_id);
+                if (epic::timeline::eraseTentative(*new_order_index, dp_new_order_valid_insert, num_new_orders_inserts, no_init + no_old) > 0) {
+                    no_has_erased_ = true;
+                }
                 no_general_ = true;
             }
         }
@@ -1416,17 +1426,18 @@ public:
                         ") in epoch " + std::to_string(epoch_id) + "; the order insert pool is too small for this run");
                 }
                 if (h_flat_rejected[0] != 0) {
-                    logger.Info("Epoch {}: OrderLine insert rejected, resolving through the timeline", epoch_id);
+                    logger.Info("Epoch {}: an OrderLine insert is not of a fresh key, resolving through the timeline", epoch_id);
                     undoAcceptedFlatOL(num_order_lines_inserts, ol_init + ol_old);
                     ol_general_ = true;
                 }
             } else {
-                const std::size_t before = order_line_index->get_size();
-                auto zipped = thrust::make_zip_iterator(thrust::make_tuple(dp_order_line_valid_insert, dp_order_line_free_rows + order_line_free_start));
-                order_line_index->insert(zipped, zipped + num_order_lines_inserts);
-                if (order_line_index->get_size() - before != num_order_lines_inserts) {
-                    logger.Info("Epoch {}: OrderLine insert rejected, resolving through the timeline", epoch_id);
-                    undoAccepted(order_line_index, dp_order_line_valid_insert, num_order_lines_inserts, ol_init + ol_old);
+                if (!epic::timeline::insertFresh(*order_line_index, ol_has_erased_, dp_order_line_valid_insert,
+                                                 dp_order_line_free_rows + order_line_free_start, num_order_lines_inserts,
+                                                 ol_init + ol_old, insert_check)) {
+                    logger.Info("Epoch {}: an OrderLine insert is not of a fresh key, resolving through the timeline", epoch_id);
+                    if (epic::timeline::eraseTentative(*order_line_index, dp_order_line_valid_insert, num_order_lines_inserts, ol_init + ol_old) > 0) {
+                        ol_has_erased_ = true;
+                    }
                     ol_general_ = true;
                 }
             }
@@ -1434,9 +1445,10 @@ public:
 
         // --- timeline paths ---
         if (no_general_ || o_general_ || ol_general_) {
-            if (no_general_) no_tl_.ensure(tpcc_config.num_txns * 11, tpcc_config.num_txns * 11);
-            if (o_general_)  o_tl_.ensure(tpcc_config.num_txns, tpcc_config.num_txns);
-            if (ol_general_) ol_tl_.ensure(tpcc_config.num_txns * 15, tpcc_config.num_txns * 15);
+            const uint64_t max_pos = uint64_t{tpcc_config.num_txns} * 4u + 2u;
+            if (no_general_) no_tl_.ensure(tpcc_config.num_txns * 11, tpcc_config.num_txns * 11, max_pos);
+            if (o_general_)  o_tl_.ensure(tpcc_config.num_txns, tpcc_config.num_txns, max_pos);
+            if (ol_general_) ol_tl_.ensure(tpcc_config.num_txns * 15, tpcc_config.num_txns * 15, max_pos);
             k_fill_growing_timeline_inputs<GpuPackedTxnArray><<<txn_blocks, block_size>>>(
                 GpuPackedTxnArray(txn_array), tpcc_config.num_txns,
                 no_general_ ? no_tl_.insKeys() : nullptr, no_general_ ? no_tl_.delKeys() : nullptr, no_general_ ? no_tl_.pos() : nullptr,
@@ -1556,8 +1568,8 @@ public:
         // Epoch-boundary index updates of the timeline tables: erase the
         // keys that end absent or replaced, then insert the final lives
         // minted this epoch.
-        if (o_general_) finalizeCuco(order_index, o_tl_);
-        if (no_general_) finalizeCuco(new_order_index, no_tl_);
+        if (o_general_ && finalizeCuco(order_index, o_tl_)) o_has_erased_ = true;
+        if (no_general_ && finalizeCuco(new_order_index, no_tl_)) no_has_erased_ = true;
         if (ol_general_) {
             if (use_flat_ol_index_) {
                 if (ol_tl_.numErase() > 0) {
@@ -1570,7 +1582,7 @@ public:
                     gpu_err_check(cudaDeviceSynchronize());
                 }
             } else {
-                finalizeCuco(order_line_index, ol_tl_);
+                if (finalizeCuco(order_line_index, ol_tl_)) ol_has_erased_ = true;
             }
         }
 
@@ -1608,10 +1620,11 @@ public:
                 edel_keys = d_no_valid_deletes;
                 d_no_edel_out = d_no_valid_delete_crids;
                 if (num_no_deletes_this_epoch > 0) {
-                    k_reset_del_pos<<<blocks_for(num_no_deletes_this_epoch), 256>>>(d_no_valid_delete_crids,
-                        num_no_deletes_this_epoch, d_no_del_pos);
+                    epic::timeline::k_reset_positions<<<blocks_for(num_no_deletes_this_epoch), 256>>>(
+                        d_no_valid_delete_crids, num_no_deletes_this_epoch, d_no_del_pos);
                     gpu_err_check(cudaPeekAtLastError());
                     new_order_index->erase(dp_no_valid_deletes, dp_no_valid_deletes + num_no_deletes_this_epoch);
+                    no_has_erased_ = true;
                     gpu_err_check(cudaStreamSynchronize(0));
                 }
             }
@@ -1630,22 +1643,6 @@ public:
         logger.Info("Finished indexing transactions");
     }
 
-    // Fast-path undo: the bulk insert accepted an unknown subset of the
-    // epoch's insert keys with their tentative CRIDs. A key whose lookup
-    // returns a tentative CRID was accepted; erase those so the map is back
-    // at its epoch-start state before the timeline resolves the epoch.
-    template <typename MapT, typename KeyT>
-    void undoAccepted(std::shared_ptr<MapT>& map, thrust::device_ptr<KeyT> keys, uint32_t n, uint32_t tentative_begin)
-    {
-        thrust::device_vector<uint32_t> found(n);
-        thrust::device_vector<KeyT> erase(n);
-        map->find(keys, keys + n, found.begin());
-        auto is_tentative = [tentative_begin, n] __device__ (uint32_t v) { return v - tentative_begin < n; };
-        auto end = thrust::copy_if(keys, keys + n, found.begin(), erase.begin(), is_tentative);
-        const uint32_t n_erase = static_cast<uint32_t>(end - erase.begin());
-        if (n_erase > 0) map->erase(erase.begin(), erase.begin() + n_erase);
-        gpu_err_check(cudaStreamSynchronize(0));
-    }
     void undoAcceptedFlatOL(uint32_t n, uint32_t tentative_begin)
     {
         thrust::device_vector<uint32_t> found(n);
@@ -1664,8 +1661,9 @@ public:
         }
         gpu_err_check(cudaDeviceSynchronize());
     }
+    // Apply a timeline's boundary update to a cuco map; true when it erased anything.
     template <typename MapT, typename TimelineT>
-    void finalizeCuco(std::shared_ptr<MapT>& map, TimelineT& tl)
+    bool finalizeCuco(std::shared_ptr<MapT>& map, TimelineT& tl)
     {
         using KeyT = typename std::remove_const<typename std::remove_pointer<decltype(tl.eraseKeys())>::type>::type;
         if (tl.numErase() > 0) {
@@ -1679,6 +1677,7 @@ public:
             map->insert(zipped, zipped + tl.numInsert());
         }
         gpu_err_check(cudaStreamSynchronize(0));
+        return tl.numErase() > 0;
     }
 
     // === CPU-shadow recovery API ===
@@ -1808,9 +1807,10 @@ public:
             new_order_key_sentinel, value_sentinel, new_order_erased_sentinel);
         order_index = std::make_shared<OrderIndexType>(
             static_cast<size_t>(std::ceil(tpcc_config.orderTableSize() / load_factor)),
-            order_key_sentinel, value_sentinel);
+            order_key_sentinel, value_sentinel, order_erased_sentinel);
         order_line_index = std::make_shared<OrderLineIndexType>(
-            cucoOLCapacity(tpcc_config), order_line_key_sentinel, value_sentinel);
+            cucoOLCapacity(tpcc_config), order_line_key_sentinel, value_sentinel, order_line_erased_sentinel);
+        no_has_erased_ = false; o_has_erased_ = false; ol_has_erased_ = false;   // fresh maps have no erased slot
 
         // 2. Reseed d_*_free_rows for the 3 growing tables. After this,
         //    free_rows[free_start + j] is the CRID the next runtime insert

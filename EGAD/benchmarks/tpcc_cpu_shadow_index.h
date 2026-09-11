@@ -153,6 +153,7 @@ public:
 
     // The live NewOrder mapping implied by the logs, as (packed key, CRID)
     // pairs, for the end-of-run map check against the GPU index.
+    std::vector<uint32_t> noLiveStateFromLogsDense(uint32_t ins_count, uint32_t del_count) const;
     std::vector<std::pair<NewOrderKey::baseType, uint32_t>> noLiveStateFromLogs(uint32_t ins_count,
                                                                                uint32_t del_count) const;
 #endif // EGAD_VALIDATION

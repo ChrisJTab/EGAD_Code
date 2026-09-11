@@ -331,10 +331,12 @@ inline uint64_t foldNoLiveEntry(uint32_t dense_idx, uint32_t crid)
 // [0, del_count). Deliberately independent of loadInitialData /
 // reconstructInsertsFromDurable / applyNoDeletesFromDurable so it can
 // catch bugs in any of them.
-uint64_t TpccCpuShadowIndex::noLiveDigestFromLogs(uint32_t ins_count, uint32_t del_count) const
+// The NewOrder live state the logs imply, one entry per dense slot: the
+// initial undelivered population, then inserts [0, ins_count) (a later entry
+// for a key replaces an earlier one), then deletes [0, del_count), each
+// erasing its key only while the key still maps to the record it ended.
+std::vector<uint32_t> TpccCpuShadowIndex::noLiveStateFromLogsDense(uint32_t ins_count, uint32_t del_count) const
 {
-    if ((ins_count > 0 && !durable_no_keys_) || (del_count > 0 && !durable_no_delete_keys_)) return 0;
-
     const uint32_t W = tpcc_config_.num_warehouses;
     const uint32_t maxO_no = max_o_orders_;
     std::vector<uint32_t> state(shadow_no_.size(), kSentinel);
@@ -356,6 +358,13 @@ uint64_t TpccCpuShadowIndex::noLiveDigestFromLogs(uint32_t ins_count, uint32_t d
         uint32_t& slot = state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)];
         if (slot == durable_no_delete_crids_[j]) slot = kSentinel;
     }
+    return state;
+}
+
+uint64_t TpccCpuShadowIndex::noLiveDigestFromLogs(uint32_t ins_count, uint32_t del_count) const
+{
+    if ((ins_count > 0 && !durable_no_keys_) || (del_count > 0 && !durable_no_delete_keys_)) return 0;
+    const std::vector<uint32_t> state = noLiveStateFromLogsDense(ins_count, del_count);
 
     uint64_t acc = 0;
     #pragma omp parallel for reduction(+:acc) schedule(static)
@@ -370,28 +379,9 @@ std::vector<std::pair<NewOrderKey::baseType, uint32_t>> TpccCpuShadowIndex::noLi
 {
     std::vector<std::pair<NewOrderKey::baseType, uint32_t>> out;
     if ((ins_count > 0 && !durable_no_keys_) || (del_count > 0 && !durable_no_delete_keys_)) return out;
-    const uint32_t W = tpcc_config_.num_warehouses;
     const uint32_t maxO_no = max_o_orders_;
-    std::vector<uint32_t> state(shadow_no_.size(), kSentinel);
-    for (uint32_t w = 1; w <= W; ++w) {
-        for (uint32_t d = 1; d <= 10; ++d) {
-            const uint32_t no_base = ((w - 1u) * 10u + (d - 1u)) * 900u;
-            for (uint32_t o = 2101; o <= 3000; ++o) {
-                state[denseIdxNO(w, d, o, maxO_no)] = no_base + (o - 2101u);
-            }
-        }
-    }
-    const uint32_t no_init = W * 10u * 900u;
-    for (uint32_t j = 0; j < ins_count; ++j) {
-        NewOrderKey k; k.base_key = durable_no_keys_[j];
-        state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)] = no_init + j;
-    }
-    for (uint32_t j = 0; j < del_count; ++j) {
-        NewOrderKey k; k.base_key = durable_no_delete_keys_[j];
-        uint32_t& slot = state[denseIdxNO(k.no_w_id, k.no_d_id, k.no_o_id, maxO_no)];
-        if (slot == durable_no_delete_crids_[j]) slot = kSentinel;
-    }
-    out.reserve(no_init);
+    const std::vector<uint32_t> state = noLiveStateFromLogsDense(ins_count, del_count);
+    out.reserve(tpcc_config_.num_warehouses * 10u * 900u);
     for (size_t i = 0; i < state.size(); ++i) {
         if (state[i] == kSentinel) continue;
         const uint32_t o = static_cast<uint32_t>(i % maxO_no) + 1u;

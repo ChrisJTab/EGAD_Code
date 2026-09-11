@@ -174,6 +174,7 @@ union NewOrderKey
         baseType no_d_id : ceilLog2(20);
         baseType no_w_id : ceilLog2(2 * kMaxWarehouses);
     };
+    static constexpr unsigned kKeyBits = ceilLog2(10'000'000) + ceilLog2(20) + ceilLog2(2 * kMaxWarehouses);
     baseType base_key = 0;
     NewOrderKey() = default;
     NewOrderKey(baseType no_o_id, baseType no_d_id, baseType no_w_id)
@@ -199,6 +200,7 @@ union OrderKey
         baseType o_d_id : ceilLog2(20);
         baseType o_w_id : ceilLog2(2 * kMaxWarehouses);
     };
+    static constexpr unsigned kKeyBits = ceilLog2(10'000'000) + ceilLog2(20) + ceilLog2(2 * kMaxWarehouses);
     baseType base_key = 0;
     OrderKey() = default;
     OrderKey(baseType o_id, baseType o_d_id, baseType o_w_id)
@@ -230,6 +232,7 @@ union OrderLineKey
         baseType ol_d_id : ceilLog2(20);
         baseType ol_w_id : ceilLog2(2 * kMaxWarehouses);
     };
+    static constexpr unsigned kKeyBits = ceilLog2(15) + ceilLog2(10'000'000) + ceilLog2(20) + ceilLog2(2 * kMaxWarehouses);
     baseType base_key = 0;
     OrderLineKey() = default;
     OrderLineKey(baseType ol_o_id, baseType ol_d_id, baseType ol_w_id, baseType ol_number)

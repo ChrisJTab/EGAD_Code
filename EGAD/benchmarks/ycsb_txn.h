@@ -19,6 +19,9 @@ enum class YcsbOpType : uint8_t
     NOOP                    /* set by the indexing phase for an op that resolves to no record at its serial position */
 };
 
+/* Record id of an op that resolves to no record. */
+constexpr uint32_t kNoRecord = 0xffffffffu;
+
 struct YcsbTxn
 {
     uint32_t keys[10];

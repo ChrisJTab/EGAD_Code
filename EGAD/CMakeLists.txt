@@ -67,13 +67,15 @@ set(EPIC_CPU_SOURCE
         benchmarks/tpcc_recovery.cpp
         benchmarks/tpcc_cpu_shadow_index.cpp
         benchmarks/ycsb_cpu_shadow_index.cpp
-        benchmarks/ycsb_timeline_oracle.cpp
         benchmarks/tpcc_index.cpp
         benchmarks/tpcc_txn_gen.cpp
         txn_bridge.cpp
         benchmarks/tpcc_cpu_executor.cpp
         benchmarks/ycsb_cpu_executor.cpp
 )
+if (EGAD_VALIDATION)
+    list(APPEND EPIC_CPU_SOURCE benchmarks/ycsb_timeline_oracle.cpp)
+endif ()
 
 set(GACCO_CPU_SOURCE
         gacco/benchmarks/tpcc.cpp

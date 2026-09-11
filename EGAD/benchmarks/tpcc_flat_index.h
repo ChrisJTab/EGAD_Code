@@ -100,37 +100,16 @@ struct OrderLineFlatView
     }
 };
 
-// Bulk insert kernel for the OL flat index. Used by InsertNewOrder
-// (run-time NewOrder inserts) which already has the keys array on
-// device. keys[i] may be the sentinel (uint64_t)-1 from the per-txn
-// submitter (see prepareTpccIndexKernel); skip those.
 #ifdef __CUDACC__
-__global__ inline void k_flat_ol_bulk_insert(
-    const OrderLineKey::baseType* __restrict__ keys,
-    const uint32_t* __restrict__ values,
-    uint32_t n,
-    uint32_t* __restrict__ d_array,
-    uint32_t max_o)
-{
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    OrderLineKey::baseType raw = keys[i];
-    if (raw == static_cast<OrderLineKey::baseType>(-1)) return;  // sentinel
-    OrderLineKey key;
-    key.base_key = raw;
-    d_array[denseIdxOL(key, max_o)] = values[i];
-}
-
 // Transient-free initial-population init for the OL flat index. The CPU
 // loader assigns CRIDs in (w, d, o, ol) lex order via thrust::sequence,
 // so the CRID for each initial row is a deterministic function of the
 // thread index and we don't need a keys/values array on device at all.
 // Decodes tid -> (w, d, o, ol), writes flat[denseIdxOL(...)] = tid.
 //
-// Saves about 1.5 GB of GPU transient at W=128 E=200 vs the older
-// approach of building a uint64_t key vector on host, uploading it, and
-// running k_flat_ol_bulk_insert over it. That transient was the binding
-// constraint for thrust's load-time allocations.
+// Saves about 1.5 GB of GPU transient at W=128 E=200 versus building a
+// uint64_t key vector on the host, uploading it, and scattering it; that
+// transient was the binding constraint for thrust's load-time allocations.
 __global__ inline void k_flat_ol_init_initial_pop(
     uint32_t* __restrict__ d_array,
     uint32_t num_warehouses,

@@ -28,6 +28,7 @@
 #ifndef EPIC_BENCHMARKS_EPOCH_TIMELINE_CUH
 #define EPIC_BENCHMARKS_EPOCH_TIMELINE_CUH
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -35,7 +36,12 @@
 #ifdef EPIC_CUDA_AVAILABLE
 
 #include <cub/cub.cuh>
+#include <thrust/device_vector.h>
+#include <thrust/equal.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/logical.h>
+#include <thrust/copy.h>
 
 #include <util_gpu_error_check.cuh>
 
@@ -68,10 +74,12 @@ struct TimelineView
     const uint32_t* c0     = nullptr;     // epoch-start record of the key (kAbsent if none)
     const uint32_t* entry_crid = nullptr; // minted CRID at a life-creating insert's entry; ended CRID at an effective delete's
     uint32_t n = 0;
+#ifdef EGAD_VALIDATION
     // Validation control: ignore positions and resolve every operation the
     // way the epoch-boundary semantics did (the epoch-start record, else the
     // first record created this epoch). The oracle must reject it.
     bool order_blind = false;
+#endif
 
     // Resolve the operation at (pos, self_entry) on `key`: the state after
     // every event of the key ordered before it; fallback (the epoch-start
@@ -90,6 +98,7 @@ struct TimelineView
         }
         if (lo == n || eventKey<PosBits>(sorted[lo]) != key) return fallback;
         uint32_t state = c0[lo];
+#ifdef EGAD_VALIDATION
         if (order_blind) {
             if (state != kAbsent) return state;
             for (uint32_t j = lo; j < n && eventKey<PosBits>(sorted[j]) == key; ++j) {
@@ -97,6 +106,7 @@ struct TimelineView
             }
             return fallback;
         }
+#endif
         for (uint32_t j = lo; j < n && eventKey<PosBits>(sorted[j]) == key; ++j) {
             const uint32_t p = eventPos<PosBits>(sorted[j]);
             if (p > pos || (p == pos && entry[j] >= self_entry)) break;
@@ -108,13 +118,71 @@ struct TimelineView
     }
 };
 
-namespace detail {
-
+// Predicate over entry indices: the entry carries a key of the bound array.
 template <typename KeyT>
 struct EntryHasKey {
     const KeyT* keys;
     __device__ bool operator()(uint32_t e) const { return keys[e] != static_cast<KeyT>(-1); }
 };
+
+// A record id that is not the sentinel.
+struct IsRecord {
+    __device__ bool operator()(uint32_t v) const { return v != kAbsent; }
+};
+
+// Clear the recorded delete position of each listed record.
+static __global__ void k_reset_positions(const uint32_t* __restrict__ crids, uint32_t n, uint32_t* __restrict__ del_pos)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    del_pos[crids[i]] = kAbsent;
+}
+
+// Insert an epoch's insert keys with their tentative CRIDs, crid_begin + j
+// for the j-th key, and report whether every key entered the map as a new
+// entry. cuco's insert rejects a key the map already holds only while the
+// map has no erased slot: it takes the first empty or erased slot on the
+// key's probe chain without looking further, so once anything has been
+// erased a live key can be entered a second time. After the first erase the
+// check is made here instead of through the map size: a lookup before the
+// insert finds a live key, a lookup after it finds a key inserted twice in
+// the epoch (both then resolve to one entry). `found` is scratch of n ids.
+template <typename Map, typename KeyIt, typename CridIt>
+bool insertFresh(Map& map, bool map_has_erased, KeyIt keys, CridIt crids, uint32_t n, uint32_t crid_begin,
+                 thrust::device_ptr<uint32_t> found)
+{
+    if (map_has_erased) {
+        map.find(keys, keys + n, found);
+        if (thrust::any_of(found, found + n, IsRecord{})) return false;
+    }
+    const std::size_t before = map.get_size();
+    auto zipped = thrust::make_zip_iterator(thrust::make_tuple(keys, crids));
+    map.insert(zipped, zipped + n);
+    if (!map_has_erased) return map.get_size() - before == n;
+    map.find(keys, keys + n, found);
+    return thrust::equal(found, found + n, thrust::counting_iterator<uint32_t>(crid_begin));
+}
+
+// Undo of a rejected insertFresh: erase every key whose entry holds a
+// tentative CRID, which puts the map back at its epoch-start state. Returns
+// the number of entries erased.
+template <typename Map, typename KeyIt>
+uint32_t eraseTentative(Map& map, KeyIt keys, uint32_t n, uint32_t crid_begin)
+{
+    using KeyT = typename std::iterator_traits<KeyIt>::value_type;
+    thrust::device_vector<uint32_t> found(n);
+    thrust::device_vector<KeyT> erase(n);
+    map.find(keys, keys + n, found.begin());
+    auto is_tentative = [crid_begin, n] __device__ (uint32_t v) { return v - crid_begin < n; };
+    auto end = thrust::copy_if(keys, keys + n, found.begin(), erase.begin(), is_tentative);
+    const uint32_t n_erase = static_cast<uint32_t>(end - erase.begin());
+    if (n_erase > 0) map.erase(erase.begin(), erase.begin() + n_erase);
+    gpu_err_check(cudaStreamSynchronize(0));
+    return n_erase;
+}
+
+namespace detail {
+
 template <typename KeyT>
 struct EntryIsEvent {
     const KeyT* ins; const KeyT* del;
@@ -249,10 +317,6 @@ __global__ void k_narrow_keys(const uint64_t* __restrict__ wide, const uint32_t*
 
 } // namespace detail
 
-namespace detail {
-
-} // namespace detail
-
 // One table's per-epoch timeline machinery. Device buffers are allocated
 // once by ensure(); build() runs the epoch. Outputs stay valid until the
 // next build().
@@ -263,10 +327,15 @@ public:
     static constexpr KeyT kNoKey = static_cast<KeyT>(-1);
     using View = TimelineView<PosBits>;
 
-    // n_entries = per-epoch input entries; e_max = the most events an epoch can hold.
-    void ensure(uint32_t n_entries, uint32_t e_max)
+    // n_entries = per-epoch input entries; e_max = the most events an epoch
+    // can hold; max_pos = the largest serial position the caller will write.
+    void ensure(uint32_t n_entries, uint32_t e_max, uint64_t max_pos)
     {
         if (ready_) return;
+        if (max_pos >= (uint64_t{1} << PosBits)) {
+            throw std::runtime_error("EpochTimeline: serial position " + std::to_string(max_pos) +
+                                     " does not fit in " + std::to_string(PosBits) + " bits");
+        }
         if (e_max > n_entries) e_max = n_entries;
         n_entries_ = n_entries; e_max_ = e_max;
         gpu_err_check(cudaMalloc(&d_ins_key_, sizeof(KeyT) * n_entries));
@@ -326,9 +395,6 @@ public:
         ready_ = true;
     }
 
-    bool ready() const { return ready_; }
-    uint32_t numEntries() const { return n_entries_; }
-
     // Per-epoch inputs (device pointers). The caller writes every entry of
     // each array it uses each epoch: kNoKey where there is no insert /
     // delete, and pos()[e] for every entry it may flag; an array the caller
@@ -347,7 +413,6 @@ public:
     void build(LookupFn lookup, uint32_t crid_begin)
     {
         auto blocks = [](uint32_t n) { return (n + 255u) / 256u; };
-        crid_begin_ = crid_begin;
         cub::DeviceSelect::If(d_temp_, temp_bytes_, thrust::counting_iterator<uint32_t>(0), d_ev_entry_, d_counts_,
             n_entries_, detail::EntryIsEvent<KeyT>{d_ins_key_, d_del_key_});
         gpu_err_check(cudaStreamSynchronize(0));
@@ -401,17 +466,21 @@ public:
     {
         View v;
         v.sorted = d_sorted_; v.entry = d_s_entry_; v.type = d_s_type_; v.c0 = d_s_c0_;
-        v.entry_crid = d_entry_crid_; v.n = n_ev_; v.order_blind = order_blind_;
+        v.entry_crid = d_entry_crid_; v.n = n_ev_;
+#ifdef EGAD_VALIDATION
+        v.order_blind = order_blind_;
+#endif
         return v;
     }
+#ifdef EGAD_VALIDATION
     void setOrderBlind(bool blind) { order_blind_ = blind; }
+#endif
 
     uint32_t numEvents() const { return n_ev_; }
     uint32_t numMinted() const { return n_minted_; }
     uint32_t numEffectiveDeletes() const { return n_edel_; }
     uint32_t numErase() const { return n_erase_; }
     uint32_t numInsert() const { return n_insert_; }
-    uint32_t cridBegin() const { return crid_begin_; }
     const KeyT* mintedKeys() const { return d_minted_keys_; }      // entry order; j-th <-> crid_begin + j
     const uint32_t* insEntries() const { return d_ins_entry_; }    // entry of the j-th minted insert
     const KeyT* edelKeys() const { return d_edel_keys_; }
@@ -422,9 +491,11 @@ public:
 
 private:
     bool ready_ = false;
+#ifdef EGAD_VALIDATION
     bool order_blind_ = false;
+#endif
     uint32_t n_entries_ = 0, e_max_ = 0;
-    uint32_t n_ev_ = 0, n_minted_ = 0, n_edel_ = 0, n_erase_ = 0, n_insert_ = 0, crid_begin_ = 0;
+    uint32_t n_ev_ = 0, n_minted_ = 0, n_edel_ = 0, n_erase_ = 0, n_insert_ = 0;
     KeyT *d_ins_key_ = nullptr, *d_del_key_ = nullptr;
     uint32_t *d_pos_ = nullptr;
     uint8_t *d_life_ev_ = nullptr, *d_edel_ev_ = nullptr;
@@ -447,7 +518,6 @@ private:
     void *d_temp_ = nullptr;
     size_t temp_bytes_ = 0;
 };
-
 
 } // namespace epic::timeline
 

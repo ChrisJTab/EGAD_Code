@@ -34,20 +34,23 @@ namespace {
 // universe. Even epochs plant only the patterns without a re-insert or an
 // insert of a live key, so the index takes its fast delete path there;
 // odd epochs plant every pattern, so the timeline fallback runs. The
-// cross-epoch patterns start every fourth epoch (their re-inserts land in
-// odd epochs). Deterministic from the seed. The oracle (validation build)
-// defines the expected outcome of every operation, so the patterns only
-// need coverage:
-//   0 read after delete (later transaction), then update and read
+// cross-epoch patterns start every fourth epoch; one re-insert lands in an
+// odd epoch and one in an even epoch, so both paths see a key that was
+// deleted in an earlier epoch. Deterministic from the seed. The oracle
+// (validation build) defines the expected outcome of every operation, so
+// the patterns only need coverage:
+//   0 read after delete (later transaction), update and read, a second delete, read
 //   1 delete, then re-insert in a later transaction, then read and update
 //   2 read, delete, read, insert, read, update inside one transaction
 //   3 insert of a fresh key, read and update, delete, read (born dead)
 //   4 read before the insert of a fresh key, insert, read
-//   5 insert of a live key (a write), then read and update
+//   5 insert of a live key (a write), then read and update; a fresh key
+//     inserted, deleted and inserted again inside one transaction
 //   6 delete twice, read, update and delete a never-inserted key, then re-insert and delete again
-//   7 delete, insert, delete, insert, read inside one transaction
+//   7 delete, insert, delete, insert, read inside one transaction; a fresh
+//     key inserted twice with reads between (the second insert is a write)
 //   8 cross-epoch: delete at e, re-insert at e+1, read and update at e+3;
-//     a second key: delete at e, re-insert at e+3
+//     a second key: delete at e, re-insert at e+2 (an even epoch), read and update at e+3
 //   9 cross-epoch chain: delete e, insert e+1, delete e+2, insert e+3, read e+4
 struct PlantedOp { epic::ycsb::YcsbOpType op; uint32_t key; };
 
@@ -87,13 +90,14 @@ void plantAdversarialDeletes(std::vector<epic::TxnArray<epic::ycsb::YcsbTxn>>& t
         const uint32_t tail = epoch_tail[e];
         const uint32_t head = (e == 0) ? static_cast<uint32_t>(config.starting_num_records) : epoch_head[e - 1];
         std::uniform_int_distribution<uint32_t> pick(tail + (head - tail) / 2, head - 1);
-        for (;;) {
+        for (int tries = 0; tries < 64; ++tries) {
             uint32_t k = pick(gen);
             bool clash = planted.count(k) != 0;
             for (const auto& u : used) clash = clash || u.key == k;
             for (uint32_t j = 0; j < filled && !clash; ++j) clash = txn->keys[j] == k;
             if (!clash) return k;
         }
+        throw std::runtime_error("ycsbx: no unplanted key left in the window for padding");
     };
     auto set_txn = [&](uint32_t e, uint32_t t, const std::vector<PlantedOp>& planted_ops) {
         if (e >= epochs || t >= num_txns) return;
@@ -120,7 +124,7 @@ void plantAdversarialDeletes(std::vector<epic::TxnArray<epic::ycsb::YcsbTxn>>& t
             switch (pattern) {
             case 0: { uint32_t k = window_key(e);
                 set_txn(e, t0, {{R, k}}); set_txn(e, t0 + 1, {{D, k}}); set_txn(e, t0 + 2, {{R, k}, {U, k}});
-                set_txn(e, t0 + 3, {{R, k}}); break; }
+                set_txn(e, t0 + 3, {{D, k}, {R, k}}); break; }
             case 1: { uint32_t k = window_key(e);
                 set_txn(e, t0, {{D, k}}); set_txn(e, t0 + 1, {{I, k}}); set_txn(e, t0 + 2, {{R, k}, {U, k}});
                 set_txn(e, t0 + 3, {{R, k}}); break; }
@@ -131,17 +135,20 @@ void plantAdversarialDeletes(std::vector<epic::TxnArray<epic::ycsb::YcsbTxn>>& t
                 set_txn(e, t0 + 3, {{R, f}}); break; }
             case 4: { uint32_t f = fresh_next++;
                 set_txn(e, t0, {{R, f}}); set_txn(e, t0 + 1, {{I, f}}); set_txn(e, t0 + 2, {{R, f}}); break; }
-            case 5: { uint32_t k = window_key(e);
-                set_txn(e, t0, {{I, k}}); set_txn(e, t0 + 1, {{R, k}, {U, k}}); break; }
+            case 5: { uint32_t k = window_key(e); uint32_t f = fresh_next++;
+                set_txn(e, t0, {{I, k}}); set_txn(e, t0 + 1, {{R, k}, {U, k}});
+                set_txn(e, t0 + 2, {{I, f}, {D, f}, {I, f}, {R, f}}); set_txn(e, t0 + 3, {{R, f}, {U, f}}); break; }
             case 6: { uint32_t k = window_key(e); uint32_t n = never_next++;
                 set_txn(e, t0, {{D, k}}); set_txn(e, t0 + 1, {{D, k}, {R, n}, {U, n}, {D, n}});
                 set_txn(e, t0 + 2, {{I, k}, {R, k}}); set_txn(e, t0 + 3, {{D, k}}); break; }
-            case 7: { uint32_t k = window_key(e);
-                set_txn(e, t0, {{D, k}, {I, k}, {D, k}, {I, k}, {R, k}}); set_txn(e, t0 + 1, {{R, k}}); break; }
+            case 7: { uint32_t k = window_key(e); uint32_t f = fresh_next++;
+                set_txn(e, t0, {{D, k}, {I, k}, {D, k}, {I, k}, {R, k}}); set_txn(e, t0 + 1, {{R, k}});
+                set_txn(e, t0 + 2, {{I, f}, {R, f}, {I, f}, {R, f}}); set_txn(e, t0 + 3, {{R, f}, {U, f}}); break; }
             case 8: { uint32_t k = window_key(e); uint32_t k2 = window_key(e);
                 set_txn(e, t0, {{D, k}}); set_txn(e + 1, t0, {{I, k}}); set_txn(e + 1, t0 + 1, {{R, k}, {U, k}});
                 set_txn(e + 3, t0, {{R, k}, {U, k}});
-                set_txn(e, t0 + 2, {{D, k2}}); set_txn(e + 3, t0 + 2, {{I, k2}, {R, k2}}); break; }
+                set_txn(e, t0 + 2, {{D, k2}}); set_txn(e + 2, t0 + 2, {{I, k2}, {R, k2}});
+                set_txn(e + 3, t0 + 2, {{R, k2}, {U, k2}}); break; }
             case 9: { uint32_t k = window_key(e);
                 set_txn(e, t0, {{D, k}}); set_txn(e + 1, t0, {{I, k}}); set_txn(e + 2, t0, {{D, k}});
                 set_txn(e + 3, t0, {{I, k}, {R, k}}); set_txn(e + 4, t0, {{R, k}, {U, k}}); break; }
@@ -984,7 +991,7 @@ void YcsbBenchmark::oracleFinalCheck()
     for (const auto& kv : oracle_->live()) { keys.push_back(kv.first); expected.push_back(kv.second); }
     uint32_t violations = 0;
     if (auto* gi = dynamic_cast<YcsbGpuIndex*>(index.get())) {
-        violations = gi->verifyLiveMapping(keys, expected, oracle_->deadSample(200000));
+        violations = gi->verifyLiveMapping(keys, expected, oracle_->deadKeys());
     }
     // Dead-record check: a record whose life ended in epoch d may carry
     // version tags up to d (its last modifications and the writeback of

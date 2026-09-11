@@ -99,15 +99,9 @@ uint32_t YcsbTimelineOracle::replayEpoch(uint32_t epoch_id, TxnArray<YcsbTxn>& i
     return epoch_mismatches;
 }
 
-std::vector<uint32_t> YcsbTimelineOracle::deadSample(size_t max_n) const
+std::vector<uint32_t> YcsbTimelineOracle::deadKeys() const
 {
-    std::vector<uint32_t> out;
-    out.reserve(std::min(max_n, dead_.size()));
-    for (uint32_t k : dead_) {
-        if (out.size() >= max_n) break;
-        out.push_back(k);
-    }
-    return out;
+    return std::vector<uint32_t>(dead_.begin(), dead_.end());
 }
 
 } // namespace epic::ycsb
