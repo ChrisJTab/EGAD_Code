@@ -862,14 +862,13 @@ void TpccDb::runBenchmark()
     std::chrono::high_resolution_clock::time_point start_time, end_time;
 
     // [AUX] One-shot host-side guard: inspect the generated txn_array and
-    // confirm no NewOrder o_id exceeds the GPU aux-index's
-    // num_slots_per_district cap. The cap comes from the shared
-    // TpccConfig::auxNumSlotsPerDistrict() (the same value the gpu_aux_index
-    // ctor sizes its arrays to), so this guard tracks the array exactly. The
-    // scan is cheap (~0.1s for 30M txns) and crashes from o_id overflow are
-    // silent on the GPU side (illegal-memory-access caught only at the next
-    // sync), so this turns a hard-to-trace runtime crash into a single startup
-    // warning. Quiet unless something is wrong.
+    // confirm no NewOrder o_id reaches the per-district order capacity,
+    // TpccConfig::auxNumSlotsPerDistrict(), which sizes both the GPU
+    // aux-index arrays and the flat OrderLine index stride (computeOLMaxO),
+    // so this guard tracks both exactly. The scan is cheap (~0.1s for 30M
+    // txns). An order id past the capacity would address another district's
+    // slots, so the run stops here, before the first epoch, naming the value
+    // to raise. Quiet unless something is wrong.
     if (config.execution_mode == ExecMode::HYBRID_STAGING)
     {
         const uint32_t cap = config.auxNumSlotsPerDistrict();
@@ -888,11 +887,10 @@ void TpccDb::runBenchmark()
             if (first_overflow_epoch == 0 && epoch_max >= cap) first_overflow_epoch = e + 1;
         }
         if (global_max_oid >= cap) {
-            logger.Info("[AUX] *** WARNING: NewOrder o_id ({}) reaches GPU aux-index cap "
-                "({}) at epoch {}. The kernel will likely fault with "
-                "an illegal-memory-access. Bump num_slots_per_district in "
-                "tpcc_gpu_aux_index.cu's ctor.",
-                global_max_oid, cap, first_overflow_epoch);
+            throw std::runtime_error("[AUX] NewOrder o_id " + std::to_string(global_max_oid) +
+                " reaches the per-district order capacity " + std::to_string(cap) + " at epoch " +
+                std::to_string(first_overflow_epoch) + " (TpccConfig::auxNumSlotsPerDistrict sizes the GPU aux index"
+                " and the flat OrderLine index stride); raise its factor for this run");
         }
     }
 

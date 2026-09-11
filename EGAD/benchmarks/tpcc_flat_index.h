@@ -43,20 +43,16 @@ inline bool flatOLEnabled(ExecMode mode)
     return envBoolOrHybridDefault("EPIC_FLAT_INDEX_OL", mode);
 }
 
-// Per-(w,d) OrderLine dense-index stride for the flat-OL path: the 3000
-// initial orders of a district plus the per-district share of the order
-// insert pool (cfg.newOrderInsertPoolSize(), which carries the sizing
-// safety factor). Dividing the OrderLine row pool by the maximum lines per
-// order instead, as an earlier version did, left each district exactly its
-// expected order count and let the busiest districts run past their stride
-// late in long runs, aliasing their lines onto the next district's slots.
-// Shared by the GPU flat index allocation and the CPU shadow OL encoding so
-// both use the same dense_idx -> slot mapping.
+// Per-(w,d) OrderLine dense-index stride for the flat-OL path: the same
+// per-district order capacity as the GPU aux index (3000 initial orders plus
+// one and a half times the district's expected share of the run's new
+// orders), so one number bounds every per-district structure and the
+// start-of-run scan over the generated order ids in tpcc.cpp checks it once
+// for all of them. Shared by the GPU flat index allocation and the CPU
+// shadow OL encoding so both use the same dense_idx -> slot mapping.
 inline uint32_t computeOLMaxO(const TpccConfig& cfg)
 {
-    const uint64_t districts = static_cast<uint64_t>(cfg.num_warehouses) * 10ull;
-    const uint64_t pool = static_cast<uint64_t>(cfg.newOrderInsertPoolSize());
-    return static_cast<uint32_t>(3000ull + (pool + districts - 1ull) / districts);
+    return cfg.auxNumSlotsPerDistrict();
 }
 
 // Compute the dense linear index for an OrderLine row. Caller supplies
