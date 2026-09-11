@@ -6,12 +6,13 @@ Three panels:
       canonical S=100K while EPIC-CPU flattens and EPIC-GPU peaks at
       100K and declines.
   (b) TPC-C (deck, W=64) throughput vs S -- same shapes.
-  (c) YCSB-F throughput vs the latency each S implies (1.5x the epoch
-      wallclock, Epic's convention): the latency-bound-throughput view.
-      The same measurements as (a), re-plotted parametrically; rings
-      mark S=100K on every curve and per-curve S labels show the
-      direction of the sweep. EGAD is the only system that keeps
-      converting latency into throughput through the swept range.
+  (c) YCSB-F latency vs throughput: the latency each S implies (1.5x
+      the epoch wallclock, Epic's convention) on a linear y axis against
+      the throughput it delivers. The same measurements as (a),
+      re-plotted parametrically; rings mark S=100K on every curve and
+      per-curve S labels show the direction of the sweep. EGAD is the
+      only system that keeps converting latency into throughput through
+      the swept range.
 
 The gray vertical line in (a)/(b) marks S=100K, the operating point of
 every other figure: it is the measured optimum of both baselines, so
@@ -191,26 +192,29 @@ def render(cells) -> None:
         ax.tick_params(axis="both", labelsize=12)
         ax.set_ylim(bottom=0)
 
-    # (c): throughput vs implied latency, YCSB-F. Same measurements as (a);
-    # x is the latency each epoch size implies for that system, so the curves
-    # are parametric in S and do not share x positions (faster systems sit
-    # left). Rings mark the canonical S=100K point on every curve, and epoch-
-    # size labels on each curve make the parametric direction visible.
+    # (c): latency vs throughput, YCSB-F. Same measurements as (a); y is the
+    # latency each epoch size implies for that system, on a linear axis, and
+    # x is its throughput, so the curves are parametric in S and do not share
+    # y positions (faster systems sit lower). Rings mark the canonical S=100K
+    # point on every curve, and epoch-size labels on each curve make the
+    # parametric direction visible.
     ax = axes[2]
-    LABEL_SPECS = {  # series -> {S: (dx_pt, dy_pt, ha)}
-        "egad": {5000: (6, -11, "left"), 100000: (10, -15, "left"),
-                 400000: (6, -11, "left")},
-        "cpu":  {5000: (6, 5, "left"), 400000: (-2, 8, "center")},
-        "gpu":  {5000: (0, 8, "center"), 100000: (0, -17, "center"),
-                 400000: (0, 8, "center")},
+    # EGAD and EPIC-CPU coincide at S=5K (same throughput, same epoch time),
+    # so that point carries one neutral label instead of one per series.
+    LABEL_SPECS = {  # series -> {S: (dx_pt, dy_pt, ha, color or None)}
+        "egad": {100000: (10, -4, "left", None), 400000: (8, -4, "left", None)},
+        "cpu":  {5000: (-6, 4, "right", "0.35"), 100000: (-10, -4, "right", None),
+                 400000: (-8, -4, "right", None)},
+        "gpu":  {5000: (0, 8, "center", None), 100000: (10, -4, "left", None),
+                 400000: (0, 8, "center", None)},
     }
     for series in SERIES_ORDER:
         data = cells.get(("ycsbf", series))
         if not data:
             continue
         ss = sorted(data)
-        x = [1.5 * statistics.mean(w for _, w in data[s]) for s in ss]
-        y = [statistics.mean(t for t, _ in data[s]) for s in ss]
+        x = [statistics.mean(t for t, _ in data[s]) for s in ss]
+        y = [1.5 * statistics.mean(w for _, w in data[s]) for s in ss]
         ax.plot(x, y, linewidth=1.6, markersize=7, **SERIES_STYLE[series])
         col = SERIES_STYLE[series]["color"]
         if CANONICAL_S in ss:
@@ -218,22 +222,19 @@ def render(cells) -> None:
             ax.plot(x[i], y[i], marker="o", markersize=14,
                     markerfacecolor="none", markeredgecolor=col,
                     markeredgewidth=1.4, linestyle="none", zorder=5)
-        for s, (dx, dy, ha) in LABEL_SPECS.get(series, {}).items():
+        for s, (dx, dy, ha, lcol) in LABEL_SPECS.get(series, {}).items():
             if s not in ss:
                 continue
             i = ss.index(s)
             ax.annotate(kfmt(s), (x[i], y[i]), textcoords="offset points",
-                        xytext=(dx, dy), fontsize=9, ha=ha, color=col)
-    ax.set_xscale("log")
-    ax.set_xlim(0.28, 95)
-    ax.set_xticks([0.5, 1, 2, 5, 10, 20, 50])
-    ax.set_xticklabels(["0.5", "1", "2", "5", "10", "20", "50"])
-    ax.xaxis.set_minor_formatter(plt.NullFormatter())
-    ax.set_xlabel(r"avg latency, $1.5\times$ epoch (ms)", fontsize=13)
-    ax.set_title("YCSB-F, latency-bound", fontsize=14)
+                        xytext=(dx, dy), fontsize=9, ha=ha, color=lcol or col)
+    ax.set_xlim(0, 47)
+    ax.set_ylim(0, 72)
+    ax.set_xlabel("Throughput (MTxn/s)", fontsize=13)
+    ax.set_ylabel(r"avg latency, $1.5\times$ epoch (ms)", fontsize=13)
+    ax.set_title("YCSB-F, latency vs throughput", fontsize=14)
     ax.grid(True, alpha=0.3, linestyle=":")
     ax.tick_params(axis="both", labelsize=12)
-    ax.set_ylim(bottom=0)
 
     axes[0].set_ylabel("Throughput (MTxn/s)", fontsize=13)
     handles = [plt.Line2D([], [], markersize=7, linewidth=1.6, **SERIES_STYLE[k])

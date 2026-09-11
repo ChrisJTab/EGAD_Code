@@ -1152,21 +1152,25 @@ conservative for EGAD."
   figure's operating point. The claim is the SHAPE contrast: both
   baselines peak or flatten at the line, EGAD alone keeps rising
   through the right edge.
-- Panel (c): the same YCSB-F data as throughput vs implied latency
-  (the Epic-Fig-10 view). The curves are parametric in S, traced from
-  5K at each curve's left end to 400K at its right, so the same epoch
+- Panel (c): the same YCSB-F data as implied latency (linear y axis)
+  vs throughput. The curves are parametric in S, traced from 5K at
+  each curve's lower end to 400K at its upper end, so the same epoch
   size lands at a different latency per system and faster systems sit
-  further left. Rings mark S=100K on every curve, per-curve S labels
-  show the sweep direction, and the ticks are plain milliseconds.
-  Read it with a latency budget in mind. At any budget, the best a
-  system offers is its highest point at or left of that x. EPIC-GPU
-  offers its maximum at ~4 ms and loses throughput beyond; EPIC-CPU
-  saturates by ~17 ms; EGAD's curve is strictly rising, so at any
-  latency target above ~17 ms it is the only system still trading
-  latency for throughput.
+  lower. Rings mark S=100K on every curve and per-curve S labels show
+  the sweep direction. Read it with a latency ceiling in mind. At any
+  ceiling, the best a system offers is its rightmost point at or below
+  that y. EPIC-GPU offers its maximum at ~4 ms and loses throughput
+  above; EPIC-CPU saturates by ~17 ms; EGAD's curve keeps moving right
+  as it rises, so at any latency target above ~17 ms it is the only
+  system still trading latency for throughput.
 - EPIC-GPU's absolute level is not the comparison (at 20 M x 120 B the
   whole database fits in HBM, the in-HBM regime of plots 04/13); its
   peak-at-100K shape is.
+
+### Note (2026-09-11)
+Panel (c) re-plotted as latency vs throughput with a linear latency axis
+(it was throughput vs log latency). Same measurements and CSV; only the
+orientation and the reading notes above changed.
 
 ### Cite (measured 2026-08-09, engine @ 54ca62c, stock upstream @ 5a7dc90 + build patches, 3 reps, mean)
 
