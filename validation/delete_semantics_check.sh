@@ -41,9 +41,14 @@ wins=$(echo "$final" | grep -oE 'write_inserts=[0-9]+' | grep -oE '[0-9]+')
 echo "[ycsbx] $final"
 echo "[ycsbx] $mapline"
 echo "[ycsbx] $deadline"
+# Both index paths must have run: the timeline fallback (an epoch whose inserts
+# were rejected) in some epochs, the fast delete path in the others.
+fallback=$(grep -ac 'resolving through the timeline' /tmp/sem_ycsbx.log)
+epochs=$(grep -ac 'Running epoch' /tmp/sem_ycsbx.log)
 if echo "$final" | grep -q 'PASS' && echo "$mapline" | grep -q 'PASS' && echo "$deadline" | grep -q 'PASS' \
-   && [ "${absent:-0}" -gt 0 ] && [ "${reins:-0}" -gt 0 ] && [ "${wins:-0}" -gt 0 ]; then
-    echo "[ycsbx] serial-order semantics: PASS (coverage: absent=$absent reinserts=$reins write_inserts=$wins)"
+   && [ "${absent:-0}" -gt 0 ] && [ "${reins:-0}" -gt 0 ] && [ "${wins:-0}" -gt 0 ] \
+   && [ "$fallback" -gt 0 ] && [ "$fallback" -lt "$epochs" ]; then
+    echo "[ycsbx] serial-order semantics: PASS (coverage: absent=$absent reinserts=$reins write_inserts=$wins; timeline fallback in $fallback of $epochs epochs, fast delete path in the others)"
 else
     echo "[ycsbx] serial-order semantics: FAIL (log: /tmp/sem_ycsbx.log)"; fail=1
 fi

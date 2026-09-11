@@ -145,14 +145,23 @@ struct GrowingTableView
     uint32_t num_minted = 0;
     const uint32_t* ins_entry = nullptr;   // entry of the j-th minted record
     uint32_t entries_per_txn = 1;          // entry / entries_per_txn = inserting transaction
+    const uint32_t* del_pos = nullptr;     // fast delete path: earliest position deleting each record this epoch
     epic::timeline::TimelineView<PosBits> tl;   // n == 0 on the fast path
 
-    __device__ __forceinline__ uint32_t resolve(uint64_t key, uint32_t found, uint32_t tid) const
+    // The record `key` resolves to before this epoch's deletes are considered.
+    __device__ __forceinline__ uint32_t visible(uint32_t found, uint32_t tid) const
     {
-        if (tl.n != 0) return tl.resolve(key, tid * 4u + 1u, 0u, false, found);
         if (found != kAbsent && found - minted_begin < num_minted) {
             if (tid < ins_entry[found - minted_begin] / entries_per_txn) return kAbsent;
         }
+        return found;
+    }
+    // The record `key` resolves to for transaction tid's reads and writes.
+    __device__ __forceinline__ uint32_t resolve(uint64_t key, uint32_t found, uint32_t tid) const
+    {
+        if (tl.n != 0) return tl.resolve(key, tid * 4u + 1u, 0u, false, found);
+        found = visible(found, tid);
+        if (del_pos != nullptr && found != kAbsent && del_pos[found] < tid * 4u + 1u) return kAbsent;
         return found;
     }
 };
@@ -673,12 +682,16 @@ __global__ void k_fill_growing_timeline_inputs(GpuTxnArrayType txn, uint32_t num
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_txns) return;
     BaseTxn *txn_ptr = txn.getTxn(tid);
+    constexpr auto kNoNo = static_cast<NewOrderKey::baseType>(-1);
+    constexpr auto kNoO  = static_cast<OrderKey::baseType>(-1);
+    constexpr auto kNoOl = static_cast<OrderLineKey::baseType>(-1);
     if (no_pos) {
         no_pos[tid * 11] = tid * 4;
         for (int i = 0; i < 10; ++i) no_pos[tid * 11 + 1 + i] = tid * 4 + 2;
+        for (int i = 0; i < 11; ++i) { no_ins[tid * 11 + i] = kNoNo; no_del[tid * 11 + i] = kNoNo; }
     }
-    if (o_pos) o_pos[tid] = tid * 4;
-    if (ol_pos) for (int i = 0; i < 15; ++i) ol_pos[tid * 15 + i] = tid * 4;
+    if (o_pos) { o_pos[tid] = tid * 4; o_ins[tid] = kNoO; }
+    if (ol_pos) for (int i = 0; i < 15; ++i) { ol_pos[tid * 15 + i] = tid * 4; ol_ins[tid * 15 + i] = kNoOl; }
     switch (static_cast<TpccTxnType>(txn_ptr->txn_type))
     {
     case TpccTxnType::NEW_ORDER: {
@@ -714,6 +727,65 @@ __global__ void k_fill_growing_timeline_inputs(GpuTxnArrayType txn, uint32_t num
     default:
         break;
     }
+}
+
+// NewOrder fast delete path, pass 1: the earliest position (tid*4+2, the
+// deleting transaction's delete class) at which each record is delivered
+// this epoch; a delivery of a record that is not visible to the
+// transaction (never inserted, or inserted later) is a no-op.
+template <typename GpuTxnArrayType>
+__global__ void k_record_no_deletes(GpuTxnArrayType txn, tpccGpuIndexFindView view, uint32_t num_txns,
+                                    uint32_t* __restrict__ del_pos)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_txns) return;
+    BaseTxn *txn_ptr = txn.getTxn(tid);
+    if (static_cast<TpccTxnType>(txn_ptr->txn_type) != TpccTxnType::DELIVERY) return;
+    auto *in = reinterpret_cast<DeliveryTxnInput *>(txn_ptr->data);
+    for (int i = 0; i < 10; ++i) {
+        if (in->o_id[i] == 0) continue;
+        NewOrderKey k; k.no_o_id = in->o_id[i]; k.no_d_id = i + 1; k.no_w_id = in->w_id;
+        const uint32_t c = view.no_tv.visible(findOrAbsent(view.new_order_view, k.base_key), tid);
+        if (c != kAbsent) atomicMin(&del_pos[c], tid * 4u + 2u);
+    }
+}
+
+// NewOrder fast delete path, pass 3 (after the lookups): the effective
+// deletes, one flag per slot (tid*10 + district) with the key and the
+// ended CRID; the delete log's order.
+template <typename GpuTxnArrayType, typename GpuTxnIndexArrayType>
+__global__ void k_no_effective_deletes(GpuTxnArrayType txn, GpuTxnIndexArrayType index, uint32_t num_txns,
+                                       const uint32_t* __restrict__ del_pos,
+                                       NewOrderKey::baseType* __restrict__ keys, uint32_t* __restrict__ crids,
+                                       uint8_t* __restrict__ flags)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_txns) return;
+    BaseTxn *txn_ptr = txn.getTxn(tid);
+    const int base = tid * 10;
+    if (static_cast<TpccTxnType>(txn_ptr->txn_type) != TpccTxnType::DELIVERY) {
+        for (int i = 0; i < 10; ++i) flags[base + i] = 0;
+        return;
+    }
+    auto *in = reinterpret_cast<DeliveryTxnInput *>(txn_ptr->data);
+    auto *params = reinterpret_cast<DeliveryTxnParams *>(index.getTxn(tid)->data);
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t c = params->new_order_id[i];
+        const bool eff = in->o_id[i] != 0 && c != kAbsent && del_pos[c] == tid * 4u + 2u;
+        flags[base + i] = eff ? 1 : 0;
+        if (eff) {
+            NewOrderKey k; k.no_o_id = in->o_id[i]; k.no_d_id = i + 1; k.no_w_id = in->w_id;
+            keys[base + i] = k.base_key;
+            crids[base + i] = c;
+        }
+    }
+}
+
+__global__ void k_reset_del_pos(const uint32_t* __restrict__ crids, uint32_t n, uint32_t* __restrict__ del_pos)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    del_pos[crids[i]] = kAbsent;
 }
 
 // Flat OL index helpers for the timeline path: epoch-start lookup of the
@@ -836,12 +908,11 @@ public:
     size_t temp_storage_bytes = 0;
 
     // Serial-order resolution of the growing tables (epoch_timeline.cuh).
-    // NewOrder takes the timeline path on every Delivery-bearing epoch (it
-    // has deletes); Order and OrderLine take the fast path (bulk insert)
-    // and fall back to the timeline when an insert is rejected because the
-    // key is already held. Each table also records the entry of every
-    // record it minted this epoch (fast path), the visibility bound of
-    // that record.
+    // All three take the fast path (bulk insert; NewOrder additionally
+    // records the first delete position of every delivered record) and
+    // fall back to the timeline when an insert is rejected because the key
+    // is already held. Each table also records the entry of every record it
+    // minted this epoch (fast path), the visibility bound of that record.
     epic::timeline::EpochTimeline<NewOrderKey::baseType, 24> no_tl_;
     epic::timeline::EpochTimeline<OrderKey::baseType, 24> o_tl_;
     epic::timeline::EpochTimeline<OrderLineKey::baseType, 22> ol_tl_;
@@ -850,6 +921,19 @@ public:
     uint32_t no_delete_count = 0;          // cumulative; the durable NO delete-log cursor
     uint32_t num_no_deletes_this_epoch = 0;
     bool no_general_ = false, o_general_ = false, ol_general_ = false;   // this epoch's paths
+    // NewOrder fast delete path (Delivery-bearing hybrid runs without a
+    // rejected insert): del_pos per NO record (allocated on first use), the
+    // per-slot effective-delete columns (tid*10 + district) and their
+    // compactions in slot order (the delete log's order).
+    uint32_t *d_no_del_pos = nullptr;
+    NewOrderKey::baseType *d_no_edel_key = nullptr, *d_no_valid_deletes = nullptr;
+    uint32_t *d_no_edel_crid = nullptr, *d_no_valid_delete_crids = nullptr;
+    uint8_t *d_no_edel_flag = nullptr;
+    thrust::device_ptr<NewOrderKey::baseType> dp_no_valid_deletes;
+    uint32_t *d_num_no_delete = nullptr, *h_num_no_delete = nullptr;   // mapped
+    void *d_no_flagged_temp = nullptr;
+    size_t no_flagged_temp_bytes = 0;
+    const uint32_t *d_no_edel_out = nullptr;   // this epoch's effective-delete CRIDs (fast or timeline path)
 
     // Flat OL index. When EPIC_FLAT_INDEX_OL=1, allocate
     // a uint32_t flat array sized to W * 10 * max_o * 15 entries instead
@@ -996,7 +1080,23 @@ public:
             }
         }
         if (tpcc_config.execution_mode == ExecMode::HYBRID_STAGING && tpcc_config.txn_mix.delivery > 0) {
-            no_tl_.ensure(tpcc_config.num_txns * 11, tpcc_config.num_txns * 11);
+            const size_t n_slots = static_cast<size_t>(tpcc_config.num_txns) * 10;
+            gpu_err_check(cudaMalloc(&d_no_edel_key, sizeof(NewOrderKey::baseType) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_valid_deletes, sizeof(NewOrderKey::baseType) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_edel_crid, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_valid_delete_crids, sizeof(uint32_t) * n_slots));
+            gpu_err_check(cudaMalloc(&d_no_edel_flag, sizeof(uint8_t) * n_slots));
+            dp_no_valid_deletes = thrust::device_pointer_cast(d_no_valid_deletes);
+            gpu_err_check(cudaHostAlloc(&h_num_no_delete, sizeof(uint32_t), cudaHostAllocMapped));
+            *h_num_no_delete = 0;
+            gpu_err_check(cudaHostGetDevicePointer(&d_num_no_delete, h_num_no_delete, 0));
+            size_t key_bytes = 0, crid_bytes = 0;
+            cub::DeviceSelect::Flagged(nullptr, key_bytes,
+                d_no_edel_key, d_no_edel_flag, d_no_valid_deletes, d_num_no_delete, n_slots);
+            cub::DeviceSelect::Flagged(nullptr, crid_bytes,
+                d_no_edel_crid, d_no_edel_flag, d_no_valid_delete_crids, d_num_no_delete, n_slots);
+            no_flagged_temp_bytes = std::max(key_bytes, crid_bytes);
+            gpu_err_check(cudaMalloc(&d_no_flagged_temp, no_flagged_temp_bytes));
         }
 
         // CPU shadow allocation now lives in TpccCpuShadowIndex's ctor
@@ -1268,7 +1368,7 @@ public:
         // OrderLine fall back to it when the bulk insert rejects a key.
         const bool delete_path = tpcc_config.execution_mode == ExecMode::HYBRID_STAGING
             && tpcc_config.txn_mix.delivery > 0;
-        no_general_ = delete_path;
+        no_general_ = false;
         o_general_ = false;
         ol_general_ = false;
 #ifdef EGAD_VALIDATION
@@ -1330,10 +1430,6 @@ public:
             if (no_general_) no_tl_.ensure(tpcc_config.num_txns * 11, tpcc_config.num_txns * 11);
             if (o_general_)  o_tl_.ensure(tpcc_config.num_txns, tpcc_config.num_txns);
             if (ol_general_) ol_tl_.ensure(tpcc_config.num_txns * 15, tpcc_config.num_txns * 15);
-            if (no_general_) no_tl_.clearInputs();
-            if (o_general_)  o_tl_.clearInputs();
-            if (ol_general_) ol_tl_.clearInputs();
-            gpu_err_check(cudaStreamSynchronize(0));
             k_fill_growing_timeline_inputs<GpuPackedTxnArray><<<txn_blocks, block_size>>>(
                 GpuPackedTxnArray(txn_array), tpcc_config.num_txns,
                 no_general_ ? no_tl_.insKeys() : nullptr, no_general_ ? no_tl_.delKeys() : nullptr, no_general_ ? no_tl_.pos() : nullptr,
@@ -1376,6 +1472,16 @@ public:
         logger.Trace("New order free rows used: {}", new_order_free_start);
         logger.Trace("Order line free rows used: {}", order_line_free_start);
 
+        // NewOrder fast delete path, pass 1: where each delivered record's
+        // first delete sits, so the lookups below can hide the record from
+        // the transactions ordered after it.
+        if (delete_path && !no_general_) {
+            if (!d_no_del_pos) {
+                gpu_err_check(cudaMalloc(&d_no_del_pos, sizeof(uint32_t) * tpcc_config.newOrderTableSize()));
+                gpu_err_check(cudaMemset(d_no_del_pos, 0xff, sizeof(uint32_t) * tpcc_config.newOrderTableSize()));
+            }
+        }
+
         // Per-table resolution state for the lookup kernel.
         index_device_view.o_tv = GrowingTableView<24>{};
         index_device_view.no_tv = GrowingTableView<24>{};
@@ -1392,6 +1498,12 @@ public:
         if (o_general_)  index_device_view.o_tv.tl = o_tl_.view();
         if (no_general_) index_device_view.no_tv.tl = no_tl_.view();
         if (ol_general_) index_device_view.ol_tv.tl = ol_tl_.view();
+        if (delete_path && !no_general_) {
+            k_record_no_deletes<GpuPackedTxnArray><<<txn_blocks, block_size>>>(GpuPackedTxnArray(txn_array),
+                index_device_view, tpcc_config.num_txns, d_no_del_pos);
+            gpu_err_check(cudaPeekAtLastError());
+            index_device_view.no_tv.del_pos = d_no_del_pos;
+        }
 
         // === Per-epoch CPU shadow mirror ===
         // Gated on durable mode (EPIC_DURABLE_STORE / EPIC_RECOVER_FROM),
@@ -1461,14 +1573,48 @@ public:
         // cpu_only / gpu_only baselines stay pure Epic.
         num_no_deletes_this_epoch = 0;
         if (delete_path) {
-            num_no_deletes_this_epoch = no_tl_.numEffectiveDeletes();
+            const NewOrderKey::baseType* edel_keys = nullptr;
+            if (no_general_) {
+                num_no_deletes_this_epoch = no_tl_.numEffectiveDeletes();
+                edel_keys = no_tl_.edelKeys();
+                d_no_edel_out = no_tl_.edelCrids();
+            } else {
+                // Fast delete path, pass 3: the effective deletes in slot order,
+                // then the erase and the reset of del_pos for the records recorded.
+                const size_t n_slots = static_cast<size_t>(tpcc_config.num_txns) * 10;
+                k_no_effective_deletes<GpuPackedTxnArray, GpuTxnArrayType><<<txn_blocks, block_size>>>(
+                    GpuPackedTxnArray(txn_array), GpuTxnArrayType(index_array), tpcc_config.num_txns, d_no_del_pos,
+                    d_no_edel_key, d_no_edel_crid, d_no_edel_flag);
+                gpu_err_check(cudaPeekAtLastError());
+                {
+                    size_t tmp = no_flagged_temp_bytes;
+                    cub::DeviceSelect::Flagged(d_no_flagged_temp, tmp,
+                        d_no_edel_key, d_no_edel_flag, d_no_valid_deletes, d_num_no_delete, n_slots);
+                }
+                {
+                    size_t tmp = no_flagged_temp_bytes;
+                    cub::DeviceSelect::Flagged(d_no_flagged_temp, tmp,
+                        d_no_edel_crid, d_no_edel_flag, d_no_valid_delete_crids, d_num_no_delete, n_slots);
+                }
+                gpu_err_check(cudaStreamSynchronize(0));
+                num_no_deletes_this_epoch = *h_num_no_delete;
+                edel_keys = d_no_valid_deletes;
+                d_no_edel_out = d_no_valid_delete_crids;
+                if (num_no_deletes_this_epoch > 0) {
+                    k_reset_del_pos<<<blocks_for(num_no_deletes_this_epoch), 256>>>(d_no_valid_delete_crids,
+                        num_no_deletes_this_epoch, d_no_del_pos);
+                    gpu_err_check(cudaPeekAtLastError());
+                    new_order_index->erase(dp_no_valid_deletes, dp_no_valid_deletes + num_no_deletes_this_epoch);
+                    gpu_err_check(cudaStreamSynchronize(0));
+                }
+            }
             logger.Info("Found {} new order deletes", num_no_deletes_this_epoch);
             if (num_no_deletes_this_epoch > 0) {
                 gpu_err_check(cudaMemcpy(
-                    shadow_.h_no_delete_keys(), no_tl_.edelKeys(),
+                    shadow_.h_no_delete_keys(), edel_keys,
                     num_no_deletes_this_epoch * sizeof(NewOrderKey::baseType), cudaMemcpyDeviceToHost));
                 gpu_err_check(cudaMemcpy(
-                    shadow_.h_no_delete_crids(), no_tl_.edelCrids(),
+                    shadow_.h_no_delete_crids(), d_no_edel_out,
                     num_no_deletes_this_epoch * sizeof(uint32_t), cudaMemcpyDeviceToHost));
                 shadow_.mirrorEpochNoDeletes(num_no_deletes_this_epoch, no_delete_count);
                 no_delete_count += num_no_deletes_this_epoch;
@@ -1833,7 +1979,7 @@ template <typename TxnArrayType, typename TxnParamArrayType>
 const uint32_t* TpccGpuIndex<TxnArrayType, TxnParamArrayType>::noDeleteCridsDevice() const
 {
     auto const &impl = std::any_cast<TpccGpuIndexImpl<TxnArrayType, TxnParamArrayType, TpccGpuTxnArrayT> const &>(gpu_index_impl);
-    return impl.no_tl_.ready() ? impl.no_tl_.edelCrids() : nullptr;
+    return impl.d_no_edel_out;
 }
 
 template <typename TxnArrayType, typename TxnParamArrayType>

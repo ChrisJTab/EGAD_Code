@@ -72,13 +72,77 @@ void __global__ k_extract_ops(GpuTxnArray txns, uint32_t *insert, uint32_t *del,
     }
 }
 
+// The record a key resolves to on the fast path, before deletes are
+// considered: the index lookup, except that a record minted this epoch is
+// visible only from the slot of its insert onward.
+__device__ __forceinline__ uint32_t fastLookup(YcsbIndexDeviceView index_view, uint32_t key, uint32_t slot,
+                                               uint32_t minted_begin, uint32_t num_minted,
+                                               const uint32_t* __restrict__ ins_slot)
+{
+    uint32_t rid = kAbsent;
+    auto record_found = index_view.find(key);
+    if (record_found != index_view.end())
+    {
+        rid = record_found->second.load(cuda::std::memory_order_relaxed);
+    }
+    if (rid != kAbsent && rid - minted_begin < num_minted && slot < ins_slot[rid - minted_begin]) rid = kAbsent;
+    return rid;
+}
+
+// Fast delete path, pass 1: record the earliest slot at which each record
+// is deleted this epoch (del_pos, per CRID, kAbsent when none).
+void __global__ k_record_deletes(GpuTxnArray txns, YcsbIndexDeviceView index_view, uint32_t num_txns,
+                                 uint32_t minted_begin, uint32_t num_minted, const uint32_t* __restrict__ ins_slot,
+                                 uint32_t* __restrict__ del_pos)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_txns) return;
+    YcsbTxn *txn = reinterpret_cast<YcsbTxn *>(txns.getTxn(tid)->data);
+    for (int i = 0; i < 10; ++i)
+    {
+        if (txn->ops[i] != YcsbOpType::DELETE) continue;
+        const uint32_t slot = tid * 10 + i;
+        const uint32_t rid = fastLookup(index_view, txn->keys[i], slot, minted_begin, num_minted, ins_slot);
+        if (rid != kAbsent) atomicMin(&del_pos[rid], slot);
+    }
+}
+
+// Fast delete path, pass 3: the effective deletes (the first delete of a
+// live record), one flag per slot with the key and the ended CRID.
+void __global__ k_effective_deletes(GpuTxnArray txns, GpuTxnArray index, uint32_t num_txns,
+                                    const uint32_t* __restrict__ del_pos,
+                                    uint32_t* __restrict__ keys, uint32_t* __restrict__ crids, uint8_t* __restrict__ flags)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_txns) return;
+    YcsbTxn *txn = reinterpret_cast<YcsbTxn *>(txns.getTxn(tid)->data);
+    YcsbTxnParam *param = reinterpret_cast<YcsbTxnParam *>(index.getTxn(tid)->data);
+    for (int i = 0; i < 10; ++i)
+    {
+        const uint32_t slot = tid * 10 + i;
+        const uint32_t rid = param->record_ids[i];
+        const bool eff = txn->ops[i] == YcsbOpType::DELETE && rid != kAbsent && del_pos[rid] == slot;
+        flags[slot] = eff ? 1 : 0;
+        if (eff) { keys[slot] = txn->keys[i]; crids[slot] = rid; }
+    }
+}
+
+void __global__ k_reset_del_pos(const uint32_t* __restrict__ crids, uint32_t n, uint32_t* __restrict__ del_pos)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    del_pos[crids[i]] = kAbsent;
+}
+
 // Translate each op's key to its record id via the index, copying ops and
 // field ids through to the executor-facing params. A key the index does not
-// hold resolves to kAbsent. Fast path (no delete events this epoch): a
-// record minted this epoch is visible only to the operations at or after
-// the slot of its insert; earlier ones resolve to kAbsent.
+// hold resolves to kAbsent. Fast path: a record minted this epoch is
+// visible only to the operations at or after the slot of its insert, and a
+// record deleted this epoch (del_pos, pass 1) only to the operations before
+// its first delete; the delete itself resolves to the record it ends.
 void __global__ indexYcsbKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDeviceView index_view, uint32_t num_txns,
-                                uint32_t minted_begin, uint32_t num_minted, const uint32_t* __restrict__ ins_slot)
+                                uint32_t minted_begin, uint32_t num_minted, const uint32_t* __restrict__ ins_slot,
+                                const uint32_t* __restrict__ del_pos)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_txns)
@@ -92,16 +156,9 @@ void __global__ indexYcsbKernel(GpuTxnArray txn, GpuTxnArray index, YcsbIndexDev
 
     for (int i = 0; i < 10; ++i)
     {
-        uint32_t rid = kAbsent;
-        auto record_found = index_view.find(txn_ptr->keys[i]);
-        if (record_found != index_view.end())
-        {
-            rid = record_found->second.load(cuda::std::memory_order_relaxed);
-        }
-        if (rid != kAbsent && rid - minted_begin < num_minted)
-        {
-            if (static_cast<uint32_t>(tid * 10 + i) < ins_slot[rid - minted_begin]) rid = kAbsent;
-        }
+        const uint32_t slot = static_cast<uint32_t>(tid * 10 + i);
+        uint32_t rid = fastLookup(index_view, txn_ptr->keys[i], slot, minted_begin, num_minted, ins_slot);
+        if (del_pos != nullptr && rid != kAbsent && del_pos[rid] < slot) rid = kAbsent;
         index_ptr->record_ids[i] = rid;
         index_ptr->ops[i] = txn_ptr->ops[i];
         index_ptr->field_ids[i] = txn_ptr->fields[i];
@@ -189,7 +246,17 @@ public:
     uint32_t num_minted_this_epoch = 0;
     uint32_t delete_count = 0;           // cumulative; the durable delete-log cursor
     uint32_t num_deletes_this_epoch = 0;
-    uint32_t *d_valid_delete_crids = nullptr;   // fast-path undo scratch
+    // Fast delete path (delete-bearing mixes without a rejected insert):
+    // del_pos[crid] = the earliest slot deleting the record this epoch
+    // (kAbsent when none), allocated on first use, reset per epoch for the
+    // recorded records; per-slot effective-delete columns and their
+    // compactions (entry order, the delete log's order).
+    uint32_t *d_del_pos = nullptr;
+    uint32_t *d_edel_crid = nullptr;
+    uint8_t  *d_edel_flag = nullptr;
+    uint32_t *d_valid_delete_crids = nullptr;   // also the fast-path undo scratch
+    const uint32_t *d_edel_out = nullptr;       // this epoch's effective-delete CRIDs (fast or timeline path)
+    bool general_this_epoch_ = false;
 
     void *d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
@@ -223,6 +290,8 @@ public:
         gpu_err_check(cudaMalloc(&d_deletes, sizeof(uint32_t) * n_slots_));
         gpu_err_check(cudaMalloc(&d_valid_deletes, sizeof(uint32_t) * n_slots_));
         gpu_err_check(cudaMalloc(&d_valid_delete_crids, sizeof(uint32_t) * n_slots_));
+        gpu_err_check(cudaMalloc(&d_edel_crid, sizeof(uint32_t) * n_slots_));
+        gpu_err_check(cudaMalloc(&d_edel_flag, sizeof(uint8_t) * n_slots_));
         gpu_err_check(cudaMalloc(&d_ins_slot, sizeof(uint32_t) * n_slots_));
         dp_inserts = thrust::device_pointer_cast(d_inserts);
         dp_valid_inserts = thrust::device_pointer_cast(d_valid_inserts);
@@ -240,6 +309,8 @@ public:
         need = std::max(need, bytes); bytes = 0;
         SlotHolds holds{d_inserts};
         cub::DeviceSelect::If(nullptr, bytes, thrust::counting_iterator<uint32_t>(0), d_ins_slot, d_num_insert, n_slots_, holds);
+        need = std::max(need, bytes); bytes = 0;
+        cub::DeviceSelect::Flagged(nullptr, bytes, d_deletes, d_edel_flag, d_valid_deletes, d_num_delete, n_slots_);
         need = std::max(need, bytes); bytes = 0;
         temp_storage_bytes = need;
         logger.Trace("Allocating {} bytes for temp storage", formatSizeBytes(temp_storage_bytes));
@@ -342,7 +413,10 @@ public:
         num_minted_this_epoch = 0;
         minted_begin_ = ycsb_config.starting_num_records + free_start;
 
-        bool general = ycsb_config.txn_mix.num_deletes > 0;
+        // Every mix starts on the fast path (bulk insert; deletes through
+        // del_pos); an epoch whose inserts are rejected resolves through the
+        // timeline instead.
+        bool general = false;
 #ifdef EGAD_VALIDATION
         // Validation hook: resolve every epoch through the timeline, so the
         // workloads without deletes exercise it and must reproduce the fast
@@ -353,7 +427,8 @@ public:
         if (!general)
         {
             // Fast path: the epoch's inserts create records, every other op
-            // resolves on the epoch-start index plus those records. The
+            // resolves on the epoch-start index plus those records, minus
+            // the records deleted before the op's slot (del_pos). The
             // minting rule is the j-th INSERT in slot order.
             IsNotSentinel pred{};
             cub::DeviceSelect::If(d_temp_storage, temp_storage_bytes, dp_inserts, dp_valid_inserts, d_num_insert,
@@ -393,15 +468,43 @@ public:
             }
             if (!general)
             {
+                const bool deletes = ycsb_config.txn_mix.num_deletes > 0;
+                if (deletes) {
+                    ensureDelPos();
+                    k_record_deletes<<<txn_blocks, block_size>>>(GpuTxnArray(txn_array), index_view, ycsb_config.num_txns,
+                        minted_begin_, num_minted_this_epoch, d_ins_slot, d_del_pos);
+                    gpu_err_check(cudaPeekAtLastError());
+                }
                 indexYcsbKernel<<<txn_blocks, block_size>>>(GpuTxnArray(txn_array), GpuTxnArray(index_array),
-                    index_view, ycsb_config.num_txns, minted_begin_, num_minted_this_epoch, d_ins_slot);
+                    index_view, ycsb_config.num_txns, minted_begin_, num_minted_this_epoch, d_ins_slot,
+                    deletes ? d_del_pos : nullptr);
                 gpu_err_check(cudaPeekAtLastError());
+                if (deletes) {
+                    k_effective_deletes<<<txn_blocks, block_size>>>(GpuTxnArray(txn_array), GpuTxnArray(index_array),
+                        ycsb_config.num_txns, d_del_pos, d_deletes, d_edel_crid, d_edel_flag);
+                    gpu_err_check(cudaPeekAtLastError());
+                    cub::DeviceSelect::Flagged(d_temp_storage, temp_storage_bytes, d_deletes, d_edel_flag, d_valid_deletes,
+                        d_num_delete, n_slots);
+                    cub::DeviceSelect::Flagged(d_temp_storage, temp_storage_bytes, d_edel_crid, d_edel_flag,
+                        d_valid_delete_crids, d_num_delete, n_slots);
+                    gpu_err_check(cudaStreamSynchronize(0));
+                    num_deletes_this_epoch = *h_num_delete;
+                    d_edel_out = d_valid_delete_crids;
+                    if (num_deletes_this_epoch > 0) {
+                        k_reset_del_pos<<<(num_deletes_this_epoch + 255) / 256, 256>>>(d_valid_delete_crids,
+                            num_deletes_this_epoch, d_del_pos);
+                        gpu_err_check(cudaPeekAtLastError());
+                        index->erase(dp_valid_deletes, dp_valid_deletes + num_deletes_this_epoch);
+                    }
+                }
                 gpu_err_check(cudaStreamSynchronize(0));
             }
         }
+        general_this_epoch_ = general;
         if (general)
         {
             resolveThroughTimeline(txn_array, index_array, epoch_id);
+            d_edel_out = tl_.edelCrids();
         }
 
         const uint32_t take = num_minted_this_epoch;
@@ -428,16 +531,23 @@ public:
         if (num_deletes_this_epoch > 0) {
             logger.Info("Found {} deletes", num_deletes_this_epoch);
             gpu_err_check(cudaMemcpy(
-                shadow_.h_delete_keys(), tl_.edelKeys(),
+                shadow_.h_delete_keys(), general ? tl_.edelKeys() : d_valid_deletes,
                 num_deletes_this_epoch * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             gpu_err_check(cudaMemcpy(
-                shadow_.h_delete_crids(), tl_.edelCrids(),
+                shadow_.h_delete_crids(), d_edel_out,
                 num_deletes_this_epoch * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             shadow_.mirrorEpochDeletes(num_deletes_this_epoch, delete_count);
             delete_count += num_deletes_this_epoch;
         } else if (ycsb_config.txn_mix.num_deletes > 0) {
             logger.Info("Found 0 deletes");
         }
+    }
+
+    void ensureDelPos()
+    {
+        if (d_del_pos) return;
+        gpu_err_check(cudaMalloc(&d_del_pos, sizeof(uint32_t) * ycsb_config.num_records));
+        gpu_err_check(cudaMemset(d_del_pos, 0xff, sizeof(uint32_t) * ycsb_config.num_records));
     }
 
     void checkFreeRows(uint32_t want)
@@ -643,7 +753,7 @@ uint32_t YcsbGpuIndex::getDeleteCount() const
 const uint32_t* YcsbGpuIndex::deleteCridsDevice() const
 {
     auto const &impl = std::any_cast<YcsbGpuIndexImpl const &>(gpu_index_impl);
-    return impl.tl_.ready() ? impl.tl_.edelCrids() : nullptr;
+    return impl.d_edel_out;
 }
 
 uint32_t YcsbGpuIndex::numDeletesThisEpoch() const

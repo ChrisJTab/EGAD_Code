@@ -31,16 +31,20 @@ namespace {
 // live key from the upper part of the window at that epoch, so the churn's
 // tail delete cannot reach it during a schedule; fresh keys come from above
 // the churn's final head; a never-inserted key lies beyond the record
-// universe. Cross-epoch patterns start every fifth epoch. Deterministic
-// from the seed. The oracle (validation build) defines the expected
-// outcome of every operation, so the patterns only need coverage:
+// universe. Even epochs plant only the patterns without a re-insert or an
+// insert of a live key, so the index takes its fast delete path there;
+// odd epochs plant every pattern, so the timeline fallback runs. The
+// cross-epoch patterns start every fourth epoch (their re-inserts land in
+// odd epochs). Deterministic from the seed. The oracle (validation build)
+// defines the expected outcome of every operation, so the patterns only
+// need coverage:
 //   0 read after delete (later transaction), then update and read
 //   1 delete, then re-insert in a later transaction, then read and update
 //   2 read, delete, read, insert, read, update inside one transaction
 //   3 insert of a fresh key, read and update, delete, read (born dead)
 //   4 read before the insert of a fresh key, insert, read
 //   5 insert of a live key (a write), then read and update
-//   6 delete twice, and read, update, delete of a never-inserted key
+//   6 delete twice, read, update and delete a never-inserted key, then re-insert and delete again
 //   7 delete, insert, delete, insert, read inside one transaction
 //   8 cross-epoch: delete at e, re-insert at e+1, read and update at e+3;
 //     a second key: delete at e, re-insert at e+3
@@ -111,7 +115,8 @@ void plantAdversarialDeletes(std::vector<epic::TxnArray<epic::ycsb::YcsbTxn>>& t
         for (uint32_t b = 0; (b * kStride) + kBlock <= num_txns; ++b) {
             const uint32_t t0 = b * kStride;
             const uint32_t pattern = b % 10;
-            if (pattern >= 8 && (e % 5) != 0) continue;
+            if (pattern >= 8 && (e % 4) != 0) continue;
+            if ((e % 2) == 0 && (pattern == 1 || pattern == 2 || pattern == 5 || pattern == 6 || pattern == 7)) continue;
             switch (pattern) {
             case 0: { uint32_t k = window_key(e);
                 set_txn(e, t0, {{R, k}}); set_txn(e, t0 + 1, {{D, k}}); set_txn(e, t0 + 2, {{R, k}, {U, k}});
