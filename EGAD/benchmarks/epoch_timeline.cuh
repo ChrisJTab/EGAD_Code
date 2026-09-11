@@ -271,6 +271,11 @@ public:
         n_entries_ = n_entries; e_max_ = e_max;
         gpu_err_check(cudaMalloc(&d_ins_key_, sizeof(KeyT) * n_entries));
         gpu_err_check(cudaMalloc(&d_del_key_, sizeof(KeyT) * n_entries));
+        // Both key arrays start as kNoKey, so a table that never has one kind
+        // of event (Order and OrderLine have no deletes) can leave that array
+        // untouched.
+        gpu_err_check(cudaMemset(d_ins_key_, 0xff, sizeof(KeyT) * n_entries));
+        gpu_err_check(cudaMemset(d_del_key_, 0xff, sizeof(KeyT) * n_entries));
         gpu_err_check(cudaMalloc(&d_pos_, sizeof(uint32_t) * n_entries));
         gpu_err_check(cudaMalloc(&d_entry_crid_, sizeof(uint32_t) * n_entries));
         gpu_err_check(cudaMalloc(&d_ins_entry_, sizeof(uint32_t) * e_max));
@@ -324,9 +329,10 @@ public:
     bool ready() const { return ready_; }
     uint32_t numEntries() const { return n_entries_; }
 
-    // Per-epoch inputs (device pointers). The caller writes every entry each
-    // epoch: kNoKey where there is no insert / delete, and pos()[e] for every
-    // entry it may flag.
+    // Per-epoch inputs (device pointers). The caller writes every entry of
+    // each array it uses each epoch: kNoKey where there is no insert /
+    // delete, and pos()[e] for every entry it may flag; an array the caller
+    // never writes keeps its initial kNoKey contents.
     KeyT* insKeys() { return d_ins_key_; }
     KeyT* delKeys() { return d_del_key_; }
     uint32_t* pos() { return d_pos_; }
