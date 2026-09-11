@@ -534,6 +534,20 @@ main-thread phases."
 
 `figures/tpcc_warehouse_sweep.{pdf,png,csv}` from `plots/09_tpcc_warehouse_sweep.py`
 
+### Note (2026-09-11)
+The tpccdeck points predate the fix of a double pick in eviction (commit
+"stager: a slot taken by the reclaim-first pass is skipped by the FIFO
+top-up"): the reclaim-first pass and the FIFO top-up could select the same
+cache slot in one eviction and bind two records to it. With the old build, a
+validation-build check of the eviction list fires on the W=64 tpccdeck cell
+in epoch 19 of 50 and stays silent on W=16, W=32, W=128 and the NP mix, so
+the W=64 run carried at least one such slot from that epoch on. Throughput is
+unaffected, since the same work ran on the same slots, and no plotted value
+depends on a run's final table contents; the current build runs the cell
+clean. A three-repetition A/B of the two builds on the deck cells at W=8,
+W=32 and W=128 measures the current build 1 to 2.4 % higher, within the
+figure's day-to-day band. The plotted data was kept as one coherent campaign.
+
 ### Headline claim
 "Across TPC-C tpccdeck (deck mix) AND TPC-C NP (NewOrder + Payment
 only — Epic's `tpcc` benchmark), hybrid_staging beats cpu_only at
