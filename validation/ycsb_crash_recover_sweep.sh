@@ -23,6 +23,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 BIN=${BIN:-EGAD/build/epic_driver}
 GPU=${GPU:-2}
 WL=${WL:-ycsbf}              # ycsbf (no inserts) | ycsbi (inserts) | ycsbw (inserts + deletes) | ycsbx (adversarial deletes)
+# Record count and initial live set; a live set larger than the cache capacity (CAP)
+# puts the eviction and reclaim paths under pressure.
+NREC=${NREC:-8000000}
+NSTART=${NSTART:-1000000}
 SEED=${SEED:-42}
 Z=${Z:-true}
 BASELINE=${BASELINE:-}
@@ -36,17 +40,17 @@ DIR=${DIR:-/dev/shm/egad_ycsb_cr}
 if [ "$WL" = "ycsbi" ]; then
     EPOCHS=${EPOCHS:-10}
     ARGS=(-b ycsbi -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
-          -n 8000000 -N 1000000 -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
+          -n "$NREC" -N "$NSTART" -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
 elif [ "$WL" = "ycsbw" ]; then
     EPOCHS=${EPOCHS:-10}
     ARGS=(-b ycsbw -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
-          -n 8000000 -N 1000000 -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
+          -n "$NREC" -N "$NSTART" -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
 elif [ "$WL" = "ycsbx" ]; then
     # Adversarial delete semantics: 12 epochs so the cross-epoch re-insert
     # patterns complete; the crash epochs should straddle them.
     EPOCHS=${EPOCHS:-12}
     ARGS=(-b ycsbx -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
-          -n 8000000 -N 1000000 -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
+          -n "$NREC" -N "$NSTART" -x gpu -e "$EPOCHS" -y hybrid_staging -z "$Z")
 else
     EPOCHS=${EPOCHS:-20}
     ARGS=(-b ycsbf -d epic -w 1 -a 0.5 -r true -c 32 -s 100000 -f false -m false
@@ -79,7 +83,8 @@ pos () { grep -aoE 'STATE-HASH\] .*0x[0-9a-f]+' "$1" | grep -oE '0x[0-9a-f]+' | 
 if [ -z "$BASELINE" ]; then
     rm -rf "$DIR"; mkdir -p "$DIR"
     blog=/tmp/ycr_baseline_${WL}_z${Z}_s${SEED}.log
-    env "${BASEENV[@]}" EPIC_DURABLE_STORE="$DIR" "${NUMA[@]}" "$BIN" "${ARGS[@]}" > "$blog" 2>&1
+    env "${BASEENV[@]}" EPIC_DURABLE_STORE="$DIR" "${NUMA[@]}" "$BIN" "${ARGS[@]}" > "$blog" 2>&1 \
+        || { echo "baseline run failed (rc=$?), see $blog"; exit 2; }
     BASELINE=$(valonly "$blog")
     BASEPOS=$(pos "$blog")
     BASELIVE=$(live "$blog")
@@ -116,16 +121,25 @@ for ce in $CES; do for cp in $CPS; do
     lfail=$(grep -aE '\[LIVE-CHECK\] FAILED' "$rlog")
     ofail=$(grep -aE '\[TIMELINE-ORACLE\] (FAILED|mismatch)|\[MAP-CHECK\] FAILED|\[DEAD-CHECK\] FAILED' "$rlog" "$wlog")
     opass=$(grep -aE '\[TIMELINE-ORACLE\] PASS' "$rlog")
+    lpass=$(grep -aE '\[LIVE-CHECK\] PASS' "$rlog")
     rlv=$(live "$rlog")
     demoted=$(grep -aoE 'demoted [0-9]+ slots' "$rlog" | grep -oE '[0-9]+' | head -1)
     ok=1; why=""
+    # The worker must have died at the injected fault and the recovering process must exit clean.
+    [ "$wrc" -eq 0 ] && { ok=0; why+=" worker_did_not_crash"; }
+    [ "$rrc" -ne 0 ] && { ok=0; why+=" recover_rc=$rrc"; }
     { [ "$rvo" = "$BASELINE" ] && [ -n "$rvo" ]; } || { ok=0; why+=" VALONLY(${rvo:-none}!=$BASELINE)"; }
     if [ -n "$BASEPOS" ]; then { [ "$rpos" = "$BASEPOS" ] && [ -n "$rpos" ]; } || { ok=0; why+=" POS(${rpos:-none}!=$BASEPOS)"; }; fi
     [ -n "$vfail" ] && { ok=0; why+=" [VERIFY]FAILED"; }
     [ -n "$lfail" ] && { ok=0; why+=" [LIVE-CHECK]FAILED"; }
     [ -n "$ofail" ] && { ok=0; why+=" [TIMELINE-ORACLE/MAP-CHECK]FAILED"; }
     [ -z "$opass" ] && { ok=0; why+=" [TIMELINE-ORACLE]missing"; }
-    if [ -n "$BASELIVE" ]; then { [ "$rlv" = "$BASELIVE" ]; } || { ok=0; why+=" LIVE(${rlv:-none}!=$BASELIVE)"; }; fi
+    if [ "$WL" = "ycsbw" ] || [ "$WL" = "ycsbx" ]; then
+        # Delete mixes must print and match the live-set digest and pass the shadow-vs-log check.
+        [ -z "$BASELIVE" ] && { ok=0; why+=" baseline_LIVE_missing"; }
+        { [ -n "$rlv" ] && [ "$rlv" = "$BASELIVE" ]; } || { ok=0; why+=" LIVE(${rlv:-none}!=${BASELIVE:-none})"; }
+        [ -z "$lpass" ] && { ok=0; why+=" [LIVE-CHECK]missing"; }
+    elif [ -n "$BASELIVE" ]; then { [ "$rlv" = "$BASELIVE" ]; } || { ok=0; why+=" LIVE(${rlv:-none}!=$BASELIVE)"; }; fi
     if [ "$ok" = 1 ]; then
         echo "  PASS  crash@e${ce} p${cp}  worker_rc=$wrc recover_rc=$rrc demoted=${demoted:-?}  VALONLY=$rvo POS=$rpos"
         pass=$((pass+1))
